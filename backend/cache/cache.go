@@ -1,20 +1,19 @@
-// +build !plan9,go1.7
+// +build !plan9
 
 package cache
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
-
-	"os"
-
-	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ncw/rclone/backend/crypt"
 	"github.com/ncw/rclone/fs"
@@ -26,7 +25,6 @@ import (
 	"github.com/ncw/rclone/fs/walk"
 	"github.com/ncw/rclone/lib/atexit"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 )
 
@@ -431,6 +429,11 @@ Purge a remote from the cache backend. Supports either a directory or a file.
 Params:
   - remote = path to remote (required)
   - withData = true/false to delete cached data (chunks) as well (optional)
+
+Eg
+
+    rclone rc cache/expire remote=path/to/sub/folder/
+    rclone rc cache/expire remote=/ withData=true 
 `,
 	})
 
@@ -470,18 +473,20 @@ func (f *Fs) httpExpireRemote(in rc.Params) (out rc.Params, err error) {
 		withData = true
 	}
 
-	// if it's wrapped by crypt we need to check what format we got
-	if cryptFs, yes := f.isWrappedByCrypt(); yes {
-		_, err := cryptFs.DecryptFileName(remote)
-		// if it failed to decrypt then it is a decrypted format and we need to encrypt it
-		if err != nil {
-			remote = cryptFs.EncryptFileName(remote)
+	if cleanPath(remote) != "" {
+		// if it's wrapped by crypt we need to check what format we got
+		if cryptFs, yes := f.isWrappedByCrypt(); yes {
+			_, err := cryptFs.DecryptFileName(remote)
+			// if it failed to decrypt then it is a decrypted format and we need to encrypt it
+			if err != nil {
+				remote = cryptFs.EncryptFileName(remote)
+			}
+			// else it's an encrypted format and we can use it as it is
 		}
-		// else it's an encrypted format and we can use it as it is
-	}
 
-	if !f.cache.HasEntry(path.Join(f.Root(), remote)) {
-		return out, errors.Errorf("%s doesn't exist in cache", remote)
+		if !f.cache.HasEntry(path.Join(f.Root(), remote)) {
+			return out, errors.Errorf("%s doesn't exist in cache", remote)
+		}
 	}
 
 	co := NewObject(f, remote)
@@ -499,17 +504,12 @@ func (f *Fs) httpExpireRemote(in rc.Params) (out rc.Params, err error) {
 		return out, nil
 	}
 	// expire the entry
-	co.CacheTs = time.Now().Add(f.fileAge * -1)
-	err = f.cache.AddObject(co)
+	err = f.cache.ExpireObject(co, withData)
 	if err != nil {
 		return out, errors.WithMessage(err, "error expiring file")
 	}
 	// notify vfs too
 	f.notifyChangeUpstream(co.Remote(), fs.EntryObject)
-	if withData {
-		// safe to ignore as the file might not have been open
-		_ = os.RemoveAll(path.Join(f.cache.dataPath, co.abs()))
-	}
 
 	out["status"] = "ok"
 	out["message"] = fmt.Sprintf("cached file cleared: %v", remote)
@@ -536,27 +536,22 @@ func (f *Fs) receiveChangeNotify(forgetPath string, entryType fs.EntryType) {
 		co := NewObject(f, forgetPath)
 		err := f.cache.GetObject(co)
 		if err != nil {
-			fs.Debugf(f, "ignoring change notification for non cached entry %v", co)
-			return
+			fs.Debugf(f, "got change notification for non cached entry %v", co)
 		}
-		// expire the entry
-		co.CacheTs = time.Now().Add(f.fileAge * -1)
-		err = f.cache.AddObject(co)
+		err = f.cache.ExpireObject(co, true)
 		if err != nil {
-			fs.Errorf(forgetPath, "notify: error expiring '%v': %v", co, err)
-		} else {
-			fs.Debugf(forgetPath, "notify: expired %v", co)
+			fs.Debugf(forgetPath, "notify: error expiring '%v': %v", co, err)
 		}
 		cd = NewDirectory(f, cleanPath(path.Dir(co.Remote())))
 	} else {
 		cd = NewDirectory(f, forgetPath)
-		// we expire the dir
-		err := f.cache.ExpireDir(cd)
-		if err != nil {
-			fs.Errorf(forgetPath, "notify: error expiring '%v': %v", cd, err)
-		} else {
-			fs.Debugf(forgetPath, "notify: expired '%v'", cd)
-		}
+	}
+	// we expire the dir
+	err := f.cache.ExpireDir(cd)
+	if err != nil {
+		fs.Debugf(forgetPath, "notify: error expiring '%v': %v", cd, err)
+	} else {
+		fs.Debugf(forgetPath, "notify: expired '%v'", cd)
 	}
 
 	f.notifiedMu.Lock()
@@ -650,7 +645,6 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 
 	// search for entry in source or temp fs
 	var obj fs.Object
-	err = nil
 	if f.tempWritePath != "" {
 		obj, err = f.tempFs.NewObject(remote)
 		// not found in temp fs
@@ -729,6 +723,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	fs.Debugf(dir, "list: source entries: %v", entries)
 
 	// and then iterate over the ones from source (temp Objects will override source ones)
+	var batchDirectories []*Directory
 	for _, entry := range entries {
 		switch o := entry.(type) {
 		case fs.Object:
@@ -750,17 +745,18 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 			cdd := DirectoryFromOriginal(f, o)
 			// check if the dir isn't expired and add it in cache if it isn't
 			if cdd2, err := f.cache.GetDir(cdd.abs()); err != nil || time.Now().Before(cdd2.CacheTs.Add(f.fileAge)) {
-				err := f.cache.AddDir(cdd)
-				if err != nil {
-					fs.Errorf(dir, "list: error caching dir from listing %v", o)
-				} else {
-					fs.Debugf(dir, "list: cached dir: %v", cdd)
-				}
+				batchDirectories = append(batchDirectories, cdd)
 			}
 			cachedEntries = append(cachedEntries, cdd)
 		default:
 			fs.Debugf(entry, "list: Unknown object type %T", entry)
 		}
+	}
+	err = f.cache.AddBatchDir(batchDirectories)
+	if err != nil {
+		fs.Errorf(dir, "list: error caching directories from listing %v", dir)
+	} else {
+		fs.Debugf(dir, "list: cached directories: %v", len(batchDirectories))
 	}
 
 	// cache dir meta
@@ -1171,8 +1167,14 @@ func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put p
 	}
 
 	// cache the new file
-	cachedObj := ObjectFromOriginal(f, obj).persist()
+	cachedObj := ObjectFromOriginal(f, obj)
+
+	// deleting cached chunks and info to be replaced with new ones
+	_ = f.cache.RemoveObject(cachedObj.abs())
+
+	cachedObj.persist()
 	fs.Debugf(cachedObj, "put: added to cache")
+
 	// expire parent
 	parentCd := NewDirectory(f, cleanPath(path.Dir(cachedObj.Remote())))
 	err = f.cache.ExpireDir(parentCd)
@@ -1421,6 +1423,15 @@ func (f *Fs) CleanUp() error {
 	return do()
 }
 
+// About gets quota information from the Fs
+func (f *Fs) About() (*fs.Usage, error) {
+	do := f.Fs.Features().About
+	if do == nil {
+		return nil, errors.New("About not supported")
+	}
+	return do()
+}
+
 // Stats returns stats about the cache storage
 func (f *Fs) Stats() (map[string]map[string]interface{}, error) {
 	return f.cache.Stats()
@@ -1559,4 +1570,5 @@ var (
 	_ fs.Wrapper        = (*Fs)(nil)
 	_ fs.ListRer        = (*Fs)(nil)
 	_ fs.ChangeNotifier = (*Fs)(nil)
+	_ fs.Abouter        = (*Fs)(nil)
 )

@@ -2,7 +2,9 @@
 package sync
 
 import (
+	"context"
 	"fmt"
+	"path"
 	"sort"
 	"sync"
 
@@ -14,7 +16,6 @@ import (
 	"github.com/ncw/rclone/fs/march"
 	"github.com/ncw/rclone/fs/operations"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 )
 
 type syncCopyMove struct {
@@ -38,9 +39,9 @@ type syncCopyMove struct {
 	srcFilesResult chan error             // error result of src listing
 	dstFilesResult chan error             // error result of dst listing
 	dstEmptyDirsMu sync.Mutex             // protect dstEmptyDirs
-	dstEmptyDirs   []fs.DirEntry          // potentially empty directories
+	dstEmptyDirs   map[string]fs.DirEntry // potentially empty directories
 	srcEmptyDirsMu sync.Mutex             // protect srcEmptyDirs
-	srcEmptyDirs   []fs.DirEntry          // potentially empty directories
+	srcEmptyDirs   map[string]fs.DirEntry // potentially empty directories
 	checkerWg      sync.WaitGroup         // wait for checkers
 	toBeChecked    fs.ObjectPairChan      // checkers channel
 	transfersWg    sync.WaitGroup         // wait for transfers
@@ -72,6 +73,8 @@ func newSyncCopyMove(fdst, fsrc fs.Fs, deleteMode fs.DeleteMode, DoMove bool, de
 		srcFilesChan:       make(chan fs.Object, fs.Config.Checkers+fs.Config.Transfers),
 		srcFilesResult:     make(chan error, 1),
 		dstFilesResult:     make(chan error, 1),
+		dstEmptyDirs:       make(map[string]fs.DirEntry),
+		srcEmptyDirs:       make(map[string]fs.DirEntry),
 		toBeChecked:        make(fs.ObjectPairChan, fs.Config.Transfers),
 		toBeUploaded:       make(fs.ObjectPairChan, fs.Config.Transfers),
 		deleteFilesCh:      make(chan fs.Object, fs.Config.Checkers),
@@ -164,6 +167,7 @@ func (s *syncCopyMove) processError(err error) {
 	switch {
 	case fserrors.IsFatalError(err):
 		if !s.aborting() {
+			fs.Errorf(nil, "Cancelling sync due to fatal error: %v", err)
 			s.cancel()
 		}
 		s.fatalErr = err
@@ -224,10 +228,18 @@ func (s *syncCopyMove) pairChecker(in fs.ObjectPairChan, out fs.ObjectPairChan, 
 							} else {
 								// If successful zero out the dst as it is no longer there and copy the file
 								pair.Dst = nil
-								out <- pair
+								select {
+								case <-s.ctx.Done():
+									return
+								case out <- pair:
+								}
 							}
 						} else {
-							out <- pair
+							select {
+							case <-s.ctx.Done():
+								return
+							case out <- pair:
+							}
 						}
 					}
 				} else {
@@ -261,7 +273,11 @@ func (s *syncCopyMove) pairRenamer(in fs.ObjectPairChan, out fs.ObjectPairChan, 
 			src := pair.Src
 			if !s.tryRename(src) {
 				// pass on if not renamed
-				out <- pair
+				select {
+				case <-s.ctx.Done():
+					return
+				case out <- pair:
+				}
 			}
 		case <-s.ctx.Done():
 			return
@@ -407,6 +423,7 @@ func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 	// Delete the spare files
 	toDelete := make(fs.ObjectsChan, fs.Config.Transfers)
 	go func() {
+	outer:
 		for remote, o := range s.dstFiles {
 			if checkSrcMap {
 				_, exists := s.srcFiles[remote]
@@ -417,7 +434,11 @@ func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 			if s.aborting() {
 				break
 			}
-			toDelete <- o
+			select {
+			case <-s.ctx.Done():
+				break outer
+			case toDelete <- o:
+			}
 		}
 		close(toDelete)
 	}()
@@ -426,8 +447,8 @@ func (s *syncCopyMove) deleteFiles(checkSrcMap bool) error {
 
 // This deletes the empty directories in the slice passed in.  It
 // ignores any errors deleting directories
-func deleteEmptyDirectories(f fs.Fs, entries fs.DirEntries) error {
-	if len(entries) == 0 {
+func deleteEmptyDirectories(f fs.Fs, entriesMap map[string]fs.DirEntry) error {
+	if len(entriesMap) == 0 {
 		return nil
 	}
 	if accounting.Stats.Errored() && !fs.Config.IgnoreErrors {
@@ -435,6 +456,10 @@ func deleteEmptyDirectories(f fs.Fs, entries fs.DirEntries) error {
 		return fs.ErrorNotDeletingDirs
 	}
 
+	var entries fs.DirEntries
+	for _, entry := range entriesMap {
+		entries = append(entries, entry)
+	}
 	// Now delete the empty directories starting from the longest path
 	sort.Sort(entries)
 	var errorCount int
@@ -462,6 +487,49 @@ func deleteEmptyDirectories(f fs.Fs, entries fs.DirEntries) error {
 		fs.Debugf(f, "deleted %d directories", okCount)
 	}
 	return nil
+}
+
+// This copies the empty directories in the slice passed in and logs
+// any errors copying the directories
+func copyEmptyDirectories(f fs.Fs, entries map[string]fs.DirEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var okCount int
+	for _, entry := range entries {
+		dir, ok := entry.(fs.Directory)
+		if ok {
+			err := f.Mkdir(dir.Remote())
+			if err != nil {
+				fs.Errorf(fs.LogDirName(f, dir.Remote()), "Failed to Mkdir: %v", err)
+				accounting.Stats.Error(err)
+			} else {
+				okCount++
+			}
+		} else {
+			fs.Errorf(f, "Not a directory: %v", entry)
+		}
+	}
+
+	if accounting.Stats.Errored() {
+		fs.Debugf(f, "failed to copy %d directories", accounting.Stats.GetErrors())
+	}
+
+	if okCount > 0 {
+		fs.Debugf(f, "copied %d directories", okCount)
+	}
+	return nil
+}
+
+func parentDirCheck(entries map[string]fs.DirEntry, entry fs.DirEntry) {
+	parentDir := path.Dir(entry.Remote())
+	if parentDir == "." {
+		parentDir = ""
+	}
+	if _, ok := entries[parentDir]; ok {
+		delete(entries, parentDir)
+	}
 }
 
 // renameHash makes a string with the size and the hash for rename detection
@@ -612,7 +680,11 @@ func (s *syncCopyMove) run() error {
 		s.makeRenameMap()
 		// Attempt renames for all the files which don't have a matching dst
 		for _, src := range s.renameCheck {
-			s.toBeRenamed <- fs.ObjectPair{Src: src, Dst: nil}
+			select {
+			case <-s.ctx.Done():
+				break
+			case s.toBeRenamed <- fs.ObjectPair{Src: src, Dst: nil}:
+			}
 		}
 	}
 
@@ -621,6 +693,8 @@ func (s *syncCopyMove) run() error {
 	s.stopRenamers()
 	s.stopTransfers()
 	s.stopDeleters()
+
+	s.processError(copyEmptyDirectories(s.fdst, s.srcEmptyDirs))
 
 	// Delete files after
 	if s.deleteMode == fs.DeleteModeAfter {
@@ -646,6 +720,9 @@ func (s *syncCopyMove) run() error {
 		//delete empty subdirectories that were part of the move
 		s.processError(deleteEmptyDirectories(s.fsrc, s.srcEmptyDirs))
 	}
+
+	// cancel the context to free resources
+	s.cancel()
 	return s.currentError()
 }
 
@@ -663,7 +740,11 @@ func (s *syncCopyMove) DstOnly(dst fs.DirEntry) (recurse bool) {
 			s.dstFiles[x.Remote()] = x
 			s.dstFilesMu.Unlock()
 		case fs.DeleteModeDuring, fs.DeleteModeOnly:
-			s.deleteFilesCh <- x
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.deleteFilesCh <- x:
+			}
 		default:
 			panic(fmt.Sprintf("unexpected delete mode %d", s.deleteMode))
 		}
@@ -672,7 +753,7 @@ func (s *syncCopyMove) DstOnly(dst fs.DirEntry) (recurse bool) {
 		// Record directory as it is potentially empty and needs deleting
 		if s.fdst.Features().CanHaveEmptyDirectories {
 			s.dstEmptyDirsMu.Lock()
-			s.dstEmptyDirs = append(s.dstEmptyDirs, dst)
+			s.dstEmptyDirs[dst.Remote()] = dst
 			s.dstEmptyDirsMu.Unlock()
 		}
 		return true
@@ -690,18 +771,33 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 	}
 	switch x := src.(type) {
 	case fs.Object:
+		// Remove parent directory from srcEmptyDirs
+		// since it's not really empty
+		s.srcEmptyDirsMu.Lock()
+		parentDirCheck(s.srcEmptyDirs, src)
+		s.srcEmptyDirsMu.Unlock()
+
 		if s.trackRenames {
 			// Save object to check for a rename later
-			s.trackRenamesCh <- x
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.trackRenamesCh <- x:
+			}
 		} else {
 			// No need to check since doesn't exist
-			s.toBeUploaded <- fs.ObjectPair{Src: x, Dst: nil}
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.toBeUploaded <- fs.ObjectPair{Src: x, Dst: nil}:
+			}
 		}
 	case fs.Directory:
 		// Do the same thing to the entire contents of the directory
 		// Record the directory for deletion
 		s.srcEmptyDirsMu.Lock()
-		s.srcEmptyDirs = append(s.srcEmptyDirs, src)
+		parentDirCheck(s.srcEmptyDirs, src)
+		s.srcEmptyDirs[src.Remote()] = src
 		s.srcEmptyDirsMu.Unlock()
 		return true
 	default:
@@ -714,12 +810,20 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 func (s *syncCopyMove) Match(dst, src fs.DirEntry) (recurse bool) {
 	switch srcX := src.(type) {
 	case fs.Object:
+		s.srcEmptyDirsMu.Lock()
+		parentDirCheck(s.srcEmptyDirs, src)
+		s.srcEmptyDirsMu.Unlock()
+
 		if s.deleteMode == fs.DeleteModeOnly {
 			return false
 		}
 		dstX, ok := dst.(fs.Object)
 		if ok {
-			s.toBeChecked <- fs.ObjectPair{Src: srcX, Dst: dstX}
+			select {
+			case <-s.ctx.Done():
+				return
+			case s.toBeChecked <- fs.ObjectPair{Src: srcX, Dst: dstX}:
+			}
 		} else {
 			// FIXME src is file, dst is directory
 			err := errors.New("can't overwrite directory with file")
@@ -732,7 +836,8 @@ func (s *syncCopyMove) Match(dst, src fs.DirEntry) (recurse bool) {
 		if ok {
 			// Record the src directory for deletion
 			s.srcEmptyDirsMu.Lock()
-			s.srcEmptyDirs = append(s.srcEmptyDirs, src)
+			parentDirCheck(s.srcEmptyDirs, src)
+			s.srcEmptyDirs[src.Remote()] = src
 			s.srcEmptyDirsMu.Unlock()
 			return true
 		}

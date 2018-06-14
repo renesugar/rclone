@@ -1,4 +1,4 @@
-// +build !plan9,go1.7
+// +build !plan9
 
 package cache
 
@@ -192,19 +192,46 @@ func (b *Persistent) GetDir(remote string) (*Directory, error) {
 
 // AddDir will update a CachedDirectory metadata and all its entries
 func (b *Persistent) AddDir(cachedDir *Directory) error {
+	return b.AddBatchDir([]*Directory{cachedDir})
+}
+
+// AddBatchDir will update a list of CachedDirectory metadata and all their entries
+func (b *Persistent) AddBatchDir(cachedDirs []*Directory) error {
+	if len(cachedDirs) == 0 {
+		return nil
+	}
+
 	return b.db.Update(func(tx *bolt.Tx) error {
-		bucket := b.getBucket(cachedDir.abs(), true, tx)
+		var bucket *bolt.Bucket
+		if cachedDirs[0].Dir == "" {
+			bucket = tx.Bucket([]byte(RootBucket))
+		} else {
+			bucket = b.getBucket(cachedDirs[0].Dir, true, tx)
+		}
 		if bucket == nil {
-			return errors.Errorf("couldn't open bucket (%v)", cachedDir)
+			return errors.Errorf("couldn't open bucket (%v)", cachedDirs[0].Dir)
 		}
 
-		encoded, err := json.Marshal(cachedDir)
-		if err != nil {
-			return errors.Errorf("couldn't marshal object (%v): %v", cachedDir, err)
-		}
-		err = bucket.Put([]byte("."), encoded)
-		if err != nil {
-			return err
+		for _, cachedDir := range cachedDirs {
+			var b *bolt.Bucket
+			var err error
+			if cachedDir.Name == "" {
+				b = bucket
+			} else {
+				b, err = bucket.CreateBucketIfNotExists([]byte(cachedDir.Name))
+			}
+			if err != nil {
+				return err
+			}
+
+			encoded, err := json.Marshal(cachedDir)
+			if err != nil {
+				return errors.Errorf("couldn't marshal object (%v): %v", cachedDir, err)
+			}
+			err = b.Put([]byte("."), encoded)
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -398,6 +425,16 @@ func (b *Persistent) RemoveObject(fp string) error {
 		_ = os.RemoveAll(path.Join(b.dataPath, fp))
 		return nil
 	})
+}
+
+// ExpireObject will flush an Object and all its data if desired
+func (b *Persistent) ExpireObject(co *Object, withData bool) error {
+	co.CacheTs = time.Now().Add(co.CacheFs.fileAge * -1)
+	err := b.AddObject(co)
+	if withData {
+		_ = os.RemoveAll(path.Join(b.dataPath, co.abs()))
+	}
+	return err
 }
 
 // HasEntry confirms the existence of a single entry (dir or object)
@@ -1059,11 +1096,4 @@ func itob(v int64) []byte {
 
 func btoi(d []byte) int64 {
 	return int64(binary.BigEndian.Uint64(d))
-}
-
-// cloneBytes returns a copy of a given slice.
-func cloneBytes(v []byte) []byte {
-	var clone = make([]byte, len(v))
-	copy(clone, v)
-	return clone
 }

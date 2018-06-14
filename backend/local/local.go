@@ -28,6 +28,7 @@ var (
 	followSymlinks = flags.BoolP("copy-links", "L", false, "Follow symlinks and copy the pointed to item.")
 	skipSymlinks   = flags.BoolP("skip-links", "", false, "Don't warn about skipped symlinks.")
 	noUTFNorm      = flags.BoolP("local-no-unicode-normalization", "", false, "Don't apply unicode normalization to paths and filenames")
+	noCheckUpdated = flags.BoolP("local-no-check-updated", "", false, "Don't check to see if the files change during upload")
 )
 
 // Constants
@@ -421,7 +422,7 @@ func (f *Fs) readPrecision() (precision time.Duration) {
 
 		// If it matches - have found the precision
 		// fmt.Println("compare", fi.ModTime(), t)
-		if fi.ModTime() == t {
+		if fi.ModTime().Equal(t) {
 			// fmt.Println("Precision detected as", duration)
 			return duration
 		}
@@ -592,7 +593,6 @@ func (o *Object) Hash(r hash.Type) (string, error) {
 	o.fs.objectHashesMu.Unlock()
 
 	if !o.modTime.Equal(oldtime) || oldsize != o.size || hashes == nil {
-		hashes = make(map[hash.Type]string)
 		in, err := os.Open(o.path)
 		if err != nil {
 			return "", errors.Wrap(err, "hash: failed to open")
@@ -642,11 +642,6 @@ func (o *Object) Storable() bool {
 		}
 	}
 	mode := o.mode
-	// On windows a file with os.ModeSymlink represents a file with reparse points
-	if runtime.GOOS == "windows" && (mode&os.ModeSymlink) != 0 {
-		fs.Debugf(o, "Clearing symlink bit to allow a file with reparse points to be copied")
-		mode &^= os.ModeSymlink
-	}
 	if mode&os.ModeSymlink != 0 {
 		if !*skipSymlinks {
 			fs.Logf(o, "Can't follow symlink without -L/--copy-links")
@@ -673,13 +668,18 @@ type localOpenFile struct {
 
 // Read bytes from the object - see io.Reader
 func (file *localOpenFile) Read(p []byte) (n int, err error) {
-	// Check if file has the same size and modTime
-	fi, err := file.fd.Stat()
-	if err != nil {
-		return 0, errors.Wrap(err, "can't read status of source file while transferring")
-	}
-	if file.o.size != fi.Size() || file.o.modTime != fi.ModTime() {
-		return 0, errors.New("can't copy - source file is being updated")
+	if !*noCheckUpdated {
+		// Check if file has the same size and modTime
+		fi, err := file.fd.Stat()
+		if err != nil {
+			return 0, errors.Wrap(err, "can't read status of source file while transferring")
+		}
+		if file.o.size != fi.Size() {
+			return 0, errors.Errorf("can't copy - source file is being updated (size changed from %d to %d)", file.o.size, fi.Size())
+		}
+		if !file.o.modTime.Equal(fi.ModTime()) {
+			return 0, errors.Errorf("can't copy - source file is being updated (mod time changed from %v to %v)", file.o.modTime, fi.ModTime())
+		}
 	}
 
 	n, err = file.in.Read(p)
@@ -729,7 +729,7 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	wrappedFd := readers.NewLimitedReadCloser(fd, limit)
 	if offset != 0 {
 		// seek the object
-		_, err = fd.Seek(offset, 0)
+		_, err = fd.Seek(offset, io.SeekStart)
 		// don't attempt to make checksums
 		return wrappedFd, err
 	}
@@ -834,7 +834,7 @@ func (o *Object) lstat() error {
 
 // Remove an object
 func (o *Object) Remove() error {
-	return os.Remove(o.path)
+	return remove(o.path)
 }
 
 // Return the directory and file from an OS path. Assumes

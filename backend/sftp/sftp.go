@@ -1,10 +1,12 @@
 // Package sftp provides a filesystem interface using github.com/pkg/sftp
 
-// +build !plan9,go1.8
+// +build !plan9,go1.9
 
 package sftp
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -27,7 +29,6 @@ import (
 	"github.com/pkg/sftp"
 	"github.com/xanzy/ssh-agent"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 )
 
@@ -40,6 +41,7 @@ var (
 
 	// Flags
 	sftpAskPassword = flags.BoolP("sftp-ask-password", "", false, "Allow asking for SFTP password when needed.")
+	sshPathOverride = flags.StringP("ssh-path-override", "", "", "Override path used by SSH connection.")
 )
 
 func init() {
@@ -74,7 +76,7 @@ func init() {
 			Optional: true,
 		}, {
 			Name:     "use_insecure_cipher",
-			Help:     "Enable the user of the aes128-cbc cipher. This cipher is insecure and may allow plaintext data to be recovered by an attacker..",
+			Help:     "Enable the user of the aes128-cbc cipher. This cipher is insecure and may allow plaintext data to be recovered by an attacker.",
 			Optional: true,
 			Examples: []fs.OptionExample{
 				{
@@ -87,7 +89,7 @@ func init() {
 			},
 		}, {
 			Name:     "disable_hashcheck",
-			Help:     "Disable the exectution of SSH commands to determine if remote file hashing is available, leave blank unless you know what you are doing.",
+			Help:     "Disable the execution of SSH commands to determine if remote file hashing is available. Leave blank or set to false to enable hashing (recommended), set to true to disable hashing.",
 			Optional: true,
 		}},
 	}
@@ -121,12 +123,6 @@ type Object struct {
 	mode    os.FileMode // mode bits from the file
 	md5sum  *string     // Cached MD5 checksum
 	sha1sum *string     // Cached SHA1 checksum
-}
-
-// ObjectReader holds the sftp.File interface to a remote SFTP file opened for reading
-type ObjectReader struct {
-	object   *Object
-	sftpFile *sftp.File
 }
 
 // readCurrentUser finds the current user name or "" if not found
@@ -338,7 +334,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 
 	// Ask for password if none was defined and we're allowed to
 	if pass == "" && *sftpAskPassword {
-		fmt.Fprint(os.Stderr, "Enter SFTP password: ")
+		_, _ = fmt.Fprint(os.Stderr, "Enter SFTP password: ")
 		clearpass := config.ReadPassword()
 		sshConfig.Auth = append(sshConfig.Auth, ssh.Password(clearpass))
 	}
@@ -733,40 +729,47 @@ func (o *Object) Remote() string {
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(r hash.Type) (string, error) {
-	if r == hash.MD5 && o.md5sum != nil {
-		return *o.md5sum, nil
-	} else if r == hash.SHA1 && o.sha1sum != nil {
-		return *o.sha1sum, nil
+	var hashCmd string
+	if r == hash.MD5 {
+		if o.md5sum != nil {
+			return *o.md5sum, nil
+		}
+		hashCmd = "md5sum"
+	} else if r == hash.SHA1 {
+		if o.sha1sum != nil {
+			return *o.sha1sum, nil
+		}
+		hashCmd = "sha1sum"
+	} else {
+		return "", hash.ErrUnsupported
 	}
 
 	c, err := o.fs.getSftpConnection()
 	if err != nil {
-		return "", errors.Wrap(err, "Hash")
+		return "", errors.Wrap(err, "Hash get SFTP connection")
 	}
 	session, err := c.sshClient.NewSession()
 	o.fs.putSftpConnection(&c, err)
 	if err != nil {
-		o.fs.cachedHashes = nil // Something has changed on the remote system
-		return "", hash.ErrUnsupported
+		return "", errors.Wrap(err, "Hash put SFTP connection")
 	}
 
-	err = hash.ErrUnsupported
-	var outputBytes []byte
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
 	escapedPath := shellEscape(o.path())
-	if r == hash.MD5 {
-		outputBytes, err = session.Output("md5sum " + escapedPath)
-	} else if r == hash.SHA1 {
-		outputBytes, err = session.Output("sha1sum " + escapedPath)
+	if *sshPathOverride != "" {
+		escapedPath = shellEscape(path.Join(*sshPathOverride, o.remote))
 	}
-
+	err = session.Run(hashCmd + " " + escapedPath)
 	if err != nil {
-		o.fs.cachedHashes = nil // Something has changed on the remote system
 		_ = session.Close()
-		return "", hash.ErrUnsupported
+		fs.Debugf(o, "Failed to calculate %v hash: %v (%s)", r, err, bytes.TrimSpace(stderr.Bytes()))
+		return "", nil
 	}
 
 	_ = session.Close()
-	str := parseHash(outputBytes)
+	str := parseHash(stdout.Bytes())
 	if r == hash.MD5 {
 		o.md5sum = &str
 	} else if r == hash.SHA1 {
@@ -868,15 +871,49 @@ func (o *Object) Storable() bool {
 	return o.mode.IsRegular()
 }
 
+// objectReader represents a file open for reading on the SFTP server
+type objectReader struct {
+	sftpFile   *sftp.File
+	pipeReader *io.PipeReader
+	done       chan struct{}
+}
+
+func newObjectReader(sftpFile *sftp.File) *objectReader {
+	pipeReader, pipeWriter := io.Pipe()
+	file := &objectReader{
+		sftpFile:   sftpFile,
+		pipeReader: pipeReader,
+		done:       make(chan struct{}),
+	}
+
+	go func() {
+		// Use sftpFile.WriteTo to pump data so that it gets a
+		// chance to build the window up.
+		_, err := sftpFile.WriteTo(pipeWriter)
+		// Close the pipeWriter so the pipeReader fails with
+		// the same error or EOF if err == nil
+		_ = pipeWriter.CloseWithError(err)
+		// signal that we've finished
+		close(file.done)
+	}()
+
+	return file
+}
+
 // Read from a remote sftp file object reader
-func (file *ObjectReader) Read(p []byte) (n int, err error) {
-	n, err = file.sftpFile.Read(p)
+func (file *objectReader) Read(p []byte) (n int, err error) {
+	n, err = file.pipeReader.Read(p)
 	return n, err
 }
 
 // Close a reader of a remote sftp file
-func (file *ObjectReader) Close() (err error) {
+func (file *objectReader) Close() (err error) {
+	// Close the sftpFile - this will likely cause the WriteTo to error
 	err = file.sftpFile.Close()
+	// Close the pipeReader so writes to the pipeWriter fail
+	_ = file.pipeReader.Close()
+	// Wait for the background process to finish
+	<-file.done
 	return err
 }
 
@@ -905,15 +942,12 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 		return nil, errors.Wrap(err, "Open failed")
 	}
 	if offset > 0 {
-		off, err := sftpFile.Seek(offset, 0)
+		off, err := sftpFile.Seek(offset, io.SeekStart)
 		if err != nil || off != offset {
 			return nil, errors.Wrap(err, "Open Seek failed")
 		}
 	}
-	in = readers.NewLimitedReadCloser(&ObjectReader{
-		object:   o,
-		sftpFile: sftpFile,
-	}, limit)
+	in = readers.NewLimitedReadCloser(newObjectReader(sftpFile), limit)
 	return in, nil
 }
 

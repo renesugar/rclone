@@ -1,10 +1,9 @@
-// +build !plan9,go1.7
+// +build !plan9
 
 package cache
 
 import (
 	"io"
-	"os"
 	"path"
 	"sync"
 	"time"
@@ -223,7 +222,7 @@ func (o *Object) Open(options ...fs.OpenOption) (io.ReadCloser, error) {
 		case *fs.RangeOption:
 			offset, limit = x.Decode(o.Size())
 		}
-		_, err = cacheReader.Seek(offset, os.SEEK_SET)
+		_, err = cacheReader.Seek(offset, io.SeekStart)
 		if err != nil {
 			return nil, err
 		}
@@ -257,6 +256,8 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 
 	// deleting cached chunks and info to be replaced with new ones
 	_ = o.CacheFs.cache.RemoveObject(o.abs())
+	// advertise to ChangeNotify if wrapped doesn't do that
+	o.CacheFs.notifyChangeUpstreamIfNeeded(o.Remote(), fs.EntryObject)
 
 	o.CacheModTime = src.ModTime().UnixNano()
 	o.CacheSize = src.Size()

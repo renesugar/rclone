@@ -122,10 +122,10 @@ Choose OneDrive account type?
  * Say p for a personal OneDrive account
 b) Business
 p) Personal
-b/p> 
+b/p>
 ```
 After that rclone requires an authentication of your account. The application will first authenticate your account, then query the OneDrive resource URL
-and do a second (silent) authentication for this resource URL. 
+and do a second (silent) authentication for this resource URL.
 
 ### Modified time and hashes ###
 
@@ -133,8 +133,11 @@ OneDrive allows modification times to be set on objects accurate to 1
 second.  These will be used to detect whether objects need syncing or
 not.
 
-One drive supports SHA1 type hashes, so you can use `--checksum` flag.
+OneDrive personal supports SHA1 type hashes. OneDrive for business and
+Sharepoint Server support
+[QuickXorHash](https://docs.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash).
 
+For all types of OneDrive you can use the `--checksum` flag.
 
 ### Deleting files ###
 
@@ -169,7 +172,7 @@ The largest allowed file size is 10GiB (10,737,418,240 bytes).
 ### Versioning issue ###
 
 Every change in OneDrive causes the service to create a new version.
-This counts against a users quota.  
+This counts against a users quota.
 For example changing the modification time of a file creates a second
 version, so the file is using twice the space.
 
@@ -185,8 +188,20 @@ versioning on OneDrive
 3. Once on the Site settings page, navigate to Site Administration > Site libraries and lists.
 4. Click Customize "Documents".
 5. Click General Settings > Versioning Settings.
-6. Under Document Version History select the option No versioning.  
+6. Under Document Version History select the option No versioning.
 Note: This will disable the creation of new file versions, but will not remove any previous versions. Your documents are safe.
 7. Apply the changes by clicking OK.
 8. Use rclone to upload or modify files. (I also use the --no-update-modtime flag)
 9. Restore the versioning settings after using rclone. (Optional)
+
+### Troubleshooting ###
+
+```
+Error: access_denied
+Code: AADSTS65005
+Description: Using application 'rclone' is currently not supported for your organization [YOUR_ORGANIZATION] because it is in an unmanaged state. An administrator needs to claim ownership of the company by DNS validation of [YOUR_ORGANIZATION] before the application rclone can be provisioned.
+```
+
+This means that rclone can't use the OneDrive for Business API with your account. You can't do much about it, maybe write an email to your admins.
+
+However, there are other ways to interact with your OneDrive account. Have a look at the webdav backend: https://rclone.org/webdav/#sharepoint

@@ -34,7 +34,7 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/drive/v3"
+	drive "google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
 
@@ -54,15 +54,17 @@ const (
 // Globals
 var (
 	// Flags
-	driveAuthOwnerOnly  = flags.BoolP("drive-auth-owner-only", "", false, "Only consider files owned by the authenticated user.")
-	driveUseTrash       = flags.BoolP("drive-use-trash", "", true, "Send files to the trash instead of deleting permanently.")
-	driveSkipGdocs      = flags.BoolP("drive-skip-gdocs", "", false, "Skip google documents in all listings.")
-	driveSharedWithMe   = flags.BoolP("drive-shared-with-me", "", false, "Only show files that are shared with me")
-	driveTrashedOnly    = flags.BoolP("drive-trashed-only", "", false, "Only show files that are in the trash")
-	driveExtensions     = flags.StringP("drive-formats", "", defaultExtensions, "Comma separated list of preferred formats for downloading Google docs.")
-	driveUseCreatedDate = flags.BoolP("drive-use-created-date", "", false, "Use created date instead of modified date.")
-	driveListChunk      = flags.Int64P("drive-list-chunk", "", 1000, "Size of listing chunk 100-1000. 0 to disable.")
-	driveImpersonate    = flags.StringP("drive-impersonate", "", "", "Impersonate this user when using a service account.")
+	driveAuthOwnerOnly    = flags.BoolP("drive-auth-owner-only", "", false, "Only consider files owned by the authenticated user.")
+	driveUseTrash         = flags.BoolP("drive-use-trash", "", true, "Send files to the trash instead of deleting permanently.")
+	driveSkipGdocs        = flags.BoolP("drive-skip-gdocs", "", false, "Skip google documents in all listings.")
+	driveSharedWithMe     = flags.BoolP("drive-shared-with-me", "", false, "Only show files that are shared with me")
+	driveTrashedOnly      = flags.BoolP("drive-trashed-only", "", false, "Only show files that are in the trash")
+	driveExtensions       = flags.StringP("drive-formats", "", defaultExtensions, "Comma separated list of preferred formats for downloading Google docs.")
+	driveUseCreatedDate   = flags.BoolP("drive-use-created-date", "", false, "Use created date instead of modified date.")
+	driveListChunk        = flags.Int64P("drive-list-chunk", "", 1000, "Size of listing chunk 100-1000. 0 to disable.")
+	driveImpersonate      = flags.StringP("drive-impersonate", "", "", "Impersonate this user when using a service account.")
+	driveAlternateExport  = flags.BoolP("drive-alternate-export", "", false, "Use alternate export URLs for google documents export.")
+	driveAcknowledgeAbuse = flags.BoolP("drive-acknowledge-abuse", "", false, "Set to allow files which return cannotDownloadAbusiveFile to be downloaded.")
 	// chunkSize is the size of the chunks created during a resumable upload and should be a power of two.
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
 	chunkSize         = fs.SizeSuffix(8 * 1024 * 1024)
@@ -292,8 +294,7 @@ func (f *Fs) list(dirID string, title string, directoriesOnly bool, filesOnly bo
 		searchTitle = strings.Replace(searchTitle, `'`, `\'`, -1)
 		// Convert ／ to / for search
 		searchTitle = strings.Replace(searchTitle, "／", "/", -1)
-		// use contains to work around #1675
-		query = append(query, fmt.Sprintf("name contains '%s'", searchTitle))
+		query = append(query, fmt.Sprintf("name='%s'", searchTitle))
 	}
 	if directoriesOnly {
 		query = append(query, fmt.Sprintf("mimeType='%s'", driveFolderType))
@@ -341,7 +342,8 @@ OUTER:
 		for _, item := range files.Files {
 			// Convert / to ／ for listing purposes
 			item.Name = strings.Replace(item.Name, "/", "／", -1)
-			// skip items introduced by workaround (#1675)
+			// Check the case of items is correct since
+			// the `=` operator is case insensitive.
 			if title != "" && title != item.Name {
 				continue
 			}
@@ -399,7 +401,7 @@ func configTeamDrive(name string) error {
 	} else {
 		fmt.Printf("Change current team drive ID %q?\n", teamDrive)
 	}
-	if !config.Confirm() {
+	if !config.ConfirmWithDefault(false) {
 		return nil
 	}
 	client, err := createOAuthClient(name)
@@ -446,12 +448,8 @@ func newPacer() *pacer.Pacer {
 	return pacer.New().SetMinSleep(minSleep).SetPacer(pacer.GoogleDrivePacer)
 }
 
-func getServiceAccountClient(keyJsonfilePath string) (*http.Client, error) {
-	data, err := ioutil.ReadFile(os.ExpandEnv(keyJsonfilePath))
-	if err != nil {
-		return nil, errors.Wrap(err, "error opening credentials file")
-	}
-	conf, err := google.JWTConfigFromJSON(data, driveConfig.Scopes...)
+func getServiceAccountClient(credentialsData []byte) (*http.Client, error) {
+	conf, err := google.JWTConfigFromJSON(credentialsData, driveConfig.Scopes...)
 	if err != nil {
 		return nil, errors.Wrap(err, "error processing credentials")
 	}
@@ -466,9 +464,18 @@ func createOAuthClient(name string) (*http.Client, error) {
 	var oAuthClient *http.Client
 	var err error
 
+	// try loading service account credentials from env variable, then from a file
+	serviceAccountCreds := []byte(config.FileGet(name, "service_account_credentials"))
 	serviceAccountPath := config.FileGet(name, "service_account_file")
-	if serviceAccountPath != "" {
-		oAuthClient, err = getServiceAccountClient(serviceAccountPath)
+	if len(serviceAccountCreds) == 0 && serviceAccountPath != "" {
+		loadedCreds, err := ioutil.ReadFile(os.ExpandEnv(serviceAccountPath))
+		if err != nil {
+			return nil, errors.Wrap(err, "error opening service account credentials file")
+		}
+		serviceAccountCreds = loadedCreds
+	}
+	if len(serviceAccountCreds) > 0 {
+		oAuthClient, err = getServiceAccountClient(serviceAccountCreds)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create oauth client from service account")
 		}
@@ -551,24 +558,28 @@ func NewFs(name, path string) (fs.Fs, error) {
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
-		newF := *f
-		newF.dirCache = dircache.New(newRoot, f.rootFolderID, &newF)
-		newF.root = newRoot
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
+		tempF.root = newRoot
 		// Make new Fs which is the parent
-		err = newF.dirCache.FindRoot(false)
+		err = tempF.dirCache.FindRoot(false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
 		}
-		entries, err := newF.List("")
+		entries, err := tempF.List("")
 		if err != nil {
 			// unable to list folder so return old f
 			return f, nil
 		}
 		for _, e := range entries {
 			if _, isObject := e.(fs.Object); isObject && e.Remote() == remote {
-				// return an error with an fs which points to the parent
-				return &newF, fs.ErrorIsFile
+				// XXX: update the old f here instead of returning tempF, since
+				// `features` were already filled with functions having *f as a receiver.
+				// See https://github.com/ncw/rclone/issues/2182
+				f.dirCache = tempF.dirCache
+				f.root = tempF.root
+				return f, fs.ErrorIsFile
 			}
 		}
 		// File doesn't exist so return old f
@@ -748,6 +759,18 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 			}
 			obj := o.(*Object)
 			obj.url = fmt.Sprintf("%sfiles/%s/export?mimeType=%s", f.svc.BasePath, item.Id, url.QueryEscape(exportMimeType))
+			if *driveAlternateExport {
+				switch item.MimeType {
+				case "application/vnd.google-apps.drawing":
+					obj.url = fmt.Sprintf("https://docs.google.com/drawings/d/%s/export/%s", item.Id, extension)
+				case "application/vnd.google-apps.document":
+					obj.url = fmt.Sprintf("https://docs.google.com/document/d/%s/export?format=%s", item.Id, extension)
+				case "application/vnd.google-apps.spreadsheet":
+					obj.url = fmt.Sprintf("https://docs.google.com/spreadsheets/d/%s/export?format=%s", item.Id, extension)
+				case "application/vnd.google-apps.presentation":
+					obj.url = fmt.Sprintf("https://docs.google.com/presentation/d/%s/export/%s", item.Id, extension)
+				}
+			}
 			obj.isDocument = true
 			obj.mimeType = exportMimeType
 			obj.bytes = -1
@@ -881,9 +904,9 @@ func (f *Fs) MergeDirs(dirs []fs.Directory) error {
 			}
 		}
 		// rmdir (into trash) the now empty source directory
+		fs.Infof(srcDir, "removing empty directory")
 		err = f.rmdir(srcDir.ID(), true)
 		if err != nil {
-			fs.Infof(srcDir, "removing empty directory")
 			return errors.Wrapf(err, "MergDirs move failed to rmdir %q", srcDir)
 		}
 	}
@@ -1046,6 +1069,34 @@ func (f *Fs) CleanUp() error {
 	return nil
 }
 
+// About gets quota information
+func (f *Fs) About() (*fs.Usage, error) {
+	if f.isTeamDrive {
+		// Teamdrives don't appear to have a usage API so just return empty
+		return &fs.Usage{}, nil
+	}
+	var about *drive.About
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		about, err = f.svc.About.Get().Fields("storageQuota").Do()
+		return shouldRetry(err)
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get Drive storageQuota")
+	}
+	q := about.StorageQuota
+	usage := &fs.Usage{
+		Used:    fs.NewUsageValue(q.UsageInDrive),           // bytes in use
+		Trashed: fs.NewUsageValue(q.UsageInDriveTrash),      // bytes in trash
+		Other:   fs.NewUsageValue(q.Usage - q.UsageInDrive), // other usage eg gmail in drive
+	}
+	if q.Limit > 0 {
+		usage.Total = fs.NewUsageValue(q.Limit)          // quota of bytes that can be used
+		usage.Free = fs.NewUsageValue(q.Limit - q.Usage) // bytes which can be uploaded before reaching the quota
+	}
+	return usage, nil
+}
+
 // Move src to this remote using server side move operations.
 //
 // This is stored with the remote path given
@@ -1089,6 +1140,41 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 
 	dstObj.setMetaData(info)
 	return dstObj, nil
+}
+
+// PublicLink adds a "readable by anyone with link" permission on the given file or folder.
+func (f *Fs) PublicLink(remote string) (link string, err error) {
+	id, err := f.dirCache.FindDir(remote, false)
+	if err == nil {
+		fs.Debugf(f, "attempting to share directory '%s'", remote)
+	} else {
+		fs.Debugf(f, "attempting to share single file '%s'", remote)
+		o := &Object{
+			fs:     f,
+			remote: remote,
+		}
+		if err = o.readMetaData(); err != nil {
+			return
+		}
+		id = o.id
+	}
+
+	permission := &drive.Permission{
+		AllowFileDiscovery: false,
+		Role:               "reader",
+		Type:               "anyone",
+	}
+
+	err = f.pacer.Call(func() (bool, error) {
+		// TODO: On TeamDrives this might fail if lacking permissions to change ACLs.
+		// Need to either check `canShare` attribute on the object or see if a sufficient permission is already present.
+		_, err = f.svc.Permissions.Create(id, permission).Fields(googleapi.Field("id")).SupportsTeamDrives(f.isTeamDrive).Do()
+		return shouldRetry(err)
+	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("https://drive.google.com/open?id=%s", id), nil
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
@@ -1156,10 +1242,16 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 	}
 
 	// Find ID of src parent
-	_, srcDirectoryID, err := srcFs.dirCache.FindPath(srcRemote, false)
+	var srcDirectoryID string
+	if srcRemote == "" {
+		srcDirectoryID, err = srcFs.dirCache.RootParentID()
+	} else {
+		_, srcDirectoryID, err = srcFs.dirCache.FindPath(srcRemote, false)
+	}
 	if err != nil {
 		return err
 	}
+
 	// Find ID of src
 	srcID, err := srcFs.dirCache.FindDir(srcRemote, false)
 	if err != nil {
@@ -1224,9 +1316,14 @@ func (f *Fs) changeNotifyRunner(notifyFunc func(string, fs.EntryType), pollInter
 		err = f.pacer.Call(func() (bool, error) {
 			changesCall := f.svc.Changes.List(pageToken).Fields("nextPageToken,newStartPageToken,changes(fileId,file(name,parents,mimeType))")
 			if *driveListChunk > 0 {
-				changesCall = changesCall.PageSize(*driveListChunk)
+				changesCall.PageSize(*driveListChunk)
 			}
-			changeList, err = changesCall.SupportsTeamDrives(f.isTeamDrive).Do()
+			if f.isTeamDrive {
+				changesCall.TeamDriveId(f.teamDriveID)
+				changesCall.SupportsTeamDrives(true)
+				changesCall.IncludeTeamDriveItems(true)
+			}
+			changeList, err = changesCall.Do()
 			return shouldRetry(err)
 		})
 		if err != nil {
@@ -1249,7 +1346,12 @@ func (f *Fs) changeNotifyRunner(notifyFunc func(string, fs.EntryType), pollInter
 				continue
 			}
 
-			if change.File != nil && change.File.MimeType != driveFolderType {
+			if change.File != nil {
+				changeType := fs.EntryDirectory
+				if change.File.MimeType != driveFolderType {
+					changeType = fs.EntryObject
+				}
+
 				// translate the parent dir of this object
 				if len(change.File.Parents) > 0 {
 					if path, ok := f.dirCache.GetInv(change.File.Parents[0]); ok {
@@ -1260,10 +1362,10 @@ func (f *Fs) changeNotifyRunner(notifyFunc func(string, fs.EntryType), pollInter
 							path = change.File.Name
 						}
 						// this will now clear the actual file too
-						pathsToClear = append(pathsToClear, entryType{path: path, entryType: fs.EntryObject})
+						pathsToClear = append(pathsToClear, entryType{path: path, entryType: changeType})
 					}
 				} else { // a true root object that is changed
-					pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: fs.EntryObject})
+					pathsToClear = append(pathsToClear, entryType{path: change.File.Name, entryType: changeType})
 				}
 			}
 		}
@@ -1448,6 +1550,12 @@ func (o *Object) httpResponse(method string, options []fs.OpenOption) (req *http
 	fs.OpenOptionAddHTTPHeaders(req.Header, options)
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err = o.fs.client.Do(req)
+		if err == nil {
+			err = googleapi.CheckResponse(res)
+			if err != nil {
+				_ = res.Body.Close() // ignore error
+			}
+		}
 		return shouldRetry(err)
 	})
 	if err != nil {
@@ -1491,16 +1599,39 @@ func (file *openFile) Close() (err error) {
 // Check it satisfies the interfaces
 var _ io.ReadCloser = &openFile{}
 
+// Checks to see if err is a googleapi.Error with of type what
+func isGoogleError(err error, what string) bool {
+	if gerr, ok := err.(*googleapi.Error); ok {
+		for _, error := range gerr.Errors {
+			if error.Reason == what {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Open an object for read
 func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	req, res, err := o.httpResponse("GET", options)
+	_, res, err := o.httpResponse("GET", options)
 	if err != nil {
-		return nil, err
-	}
-	_, isRanging := req.Header["Range"]
-	if !(res.StatusCode == http.StatusOK || (isRanging && res.StatusCode == http.StatusPartialContent)) {
-		_ = res.Body.Close() // ignore error
-		return nil, errors.Errorf("bad response: %d: %s", res.StatusCode, res.Status)
+		if isGoogleError(err, "cannotDownloadAbusiveFile") {
+			if *driveAcknowledgeAbuse {
+				// Retry acknowledging abuse
+				if strings.ContainsRune(o.url, '?') {
+					o.url += "&"
+				} else {
+					o.url += "?"
+				}
+				o.url += "acknowledgeAbuse=true"
+				_, res, err = o.httpResponse("GET", options)
+			} else {
+				err = errors.Wrap(err, "Use the --drive-acknowledge-abuse flag to download this file")
+			}
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "open file failed")
+		}
 	}
 	// If it is a document, update the size with what we are
 	// reading as it can change from the HEAD in the listing to
@@ -1581,6 +1712,11 @@ func (o *Object) MimeType() string {
 	return o.mimeType
 }
 
+// ID returns the ID of the Object if known, or "" if not
+func (o *Object) ID() string {
+	return o.id
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs              = (*Fs)(nil)
@@ -1593,7 +1729,10 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.ChangeNotifier  = (*Fs)(nil)
 	_ fs.PutUncheckeder  = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.MergeDirser     = (*Fs)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
-	_ fs.MimeTyper       = &Object{}
+	_ fs.MimeTyper       = (*Object)(nil)
+	_ fs.IDer            = (*Object)(nil)
 )

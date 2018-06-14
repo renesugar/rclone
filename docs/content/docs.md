@@ -33,9 +33,11 @@ See the following for detailed instructions for
   * [Google Drive](/drive/)
   * [HTTP](/http/)
   * [Hubic](/hubic/)
+  * [Mega](/mega/)
   * [Microsoft Azure Blob Storage](/azureblob/)
   * [Microsoft OneDrive](/onedrive/)
   * [Openstack Swift / Rackspace Cloudfiles / Memset Memstore](/swift/)
+  * [OpenDrive](/opendrive/)
   * [Pcloud](/pcloud/)
   * [QingStor](/qingstor/)
   * [SFTP](/sftp/)
@@ -98,6 +100,7 @@ The main rclone commands with most used first
 * [rclone moveto](/commands/rclone_moveto/)	- Move file or directory from source to dest.
 * [rclone obscure](/commands/rclone_obscure/)	- Obscure password for use in the rclone.conf
 * [rclone cryptcheck](/commands/rclone_cryptcheck/)	- Check the integrity of a crypted remote.
+* [rclone about](/commands/rclone_about/)	- Get quota information from the remote.
 
 See the [commands index](/commands/) for the full list.
 
@@ -226,9 +229,9 @@ fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m". Valid
 time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
 Options which use SIZE use kByte by default.  However, a suffix of `b`
-for bytes, `k` for kBytes, `M` for MBytes and `G` for GBytes may be
-used.  These are the binary units, eg 1, 2\*\*10, 2\*\*20, 2\*\*30
-respectively.
+for bytes, `k` for kBytes, `M` for MBytes, `G` for GBytes, `T` for
+TBytes and `P` for PBytes may be used.  These are the binary units, eg
+1, 2\*\*10, 2\*\*20, 2\*\*30 respectively.
 
 ### --backup-dir=DIR ###
 
@@ -474,6 +477,10 @@ This can be useful for tracking down problems with syncs in
 combination with the `-v` flag.  See the [Logging section](#logging)
 for more info.
 
+Note that if you are using the `logrotate` program to manage rclone's
+logs, then you should use the `copytruncate` option as rclone doesn't
+have a signal to rotate logs.
+
 ### --log-level LEVEL ###
 
 This sets the log level for rclone.  The default log level is `NOTICE`.
@@ -530,6 +537,15 @@ files not recursed through are considered excluded and will be deleted
 on the destination.  Test first with `--dry-run` if you are not sure
 what will happen.
 
+### --max-transfer=SIZE ###
+
+Rclone will stop transferring when it has reached the size specified.
+Defaults to off.
+
+When the limit is reached all transfers will stop immediately.
+
+Rclone will exit with exit code 8 if the transfer limit is reached.
+
 ### --modify-window=TIME ###
 
 When checking whether a file has been modified, this is the maximum
@@ -575,6 +591,12 @@ files which didn't get transferred because of errors.
 
 Disable retries with `--retries 1`.
 
+### --retries-sleep=TIME ###
+
+This sets the interval between each retry specified by `--retries` 
+
+The default is 0. Use 0 to disable.
+
 ### --size-only ###
 
 Normally rclone will look at modification time and size of files to
@@ -603,6 +625,9 @@ Stats are logged at `INFO` level by default which means they won't
 show at default log level `NOTICE`.  Use `--stats-log-level NOTICE` or
 `-v` to make them show.  See the [Logging section](#logging) for more
 info on log levels.
+
+Note that on macOS you can send a SIGINFO (which is normally ctrl-T in
+the terminal) to make the stats print immediately.
 
 ### --stats-file-name-length integer ###
 By default, the `--stats` output will truncate file names and paths longer 
@@ -799,6 +824,19 @@ This can be useful when transferring to a remote which doesn't support
 mod times directly as it is more accurate than a `--size-only` check
 and faster than using `--checksum`.
 
+### --use-server-modtime ###
+
+Some object-store backends (e.g, Swift, S3) do not preserve file modification
+times (modtime). On these backends, rclone stores the original modtime as
+additional metadata on the object. By default it will make an API call to
+retrieve the metadata when the modtime is needed by an operation.
+
+Use this flag to disable the extra API call and rely instead on the server's
+modified time. In cases such as a local to remote sync, knowing the local file
+is newer than the time it was last uploaded to the remote is sufficient. In
+those cases, this flag can speed up the process and reduce the number of API
+calls necessary.
+
 ### -v, -vv, --verbose ###
 
 With `-v` rclone will tell you about each file that is transferred and
@@ -953,6 +991,17 @@ only.
 Dump the filters to the output.  Useful to see exactly what include
 and exclude options are filtering on.
 
+#### --dump goroutines ####
+
+This dumps a list of the running go-routines at the end of the command
+to standard output.
+
+#### --dump openfiles ####
+
+This dumps a list of the open files at the end of the command.  It
+uses the `lsof` command to do that so you'll need that installed to
+use it.
+
 ### --memprofile=FILE ###
 
 Write memory profile to file. This can be analysed with `go tool pprof`.
@@ -1060,6 +1109,7 @@ it will log a high priority message if the retry was successful.
   * `5` - Temporary error (one that more retries might fix) (Retry errors)
   * `6` - Less serious errors (like 461 errors from dropbox) (NoRetry errors)
   * `7` - Fatal error (one that more retries won't fix, like account suspended) (Fatal errors)
+  * `8` - Transfer exceeded - limit set by --max-transfer reached
 
 Environment Variables
 ---------------------

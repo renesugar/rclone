@@ -31,7 +31,14 @@ import (
 
 // Client interface describes all routes in this namespace
 type Client interface {
-	// GetEvents : Retrieves team events. Permission : Team Auditing.
+	// GetEvents : Retrieves team events. Events have a lifespan of two years.
+	// Events older than two years will not be returned. Many attributes note
+	// 'may be missing due to historical data gap'. Note that the
+	// file_operations category and & analogous paper events are not available
+	// on all Dropbox Business `plans` </business/plans-comparison>. Use
+	// `features/get_values`
+	// </developers/documentation/http/teams#team-features-get_values> to check
+	// for this feature. Permission : Team Auditing.
 	GetEvents(arg *GetTeamEventsArg) (res *GetTeamEventsResult, err error)
 	// GetEventsContinue : Once a cursor has been retrieved from `getEvents`,
 	// use this to paginate through all events. Permission : Team Auditing.
