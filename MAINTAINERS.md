@@ -1,12 +1,19 @@
 # Maintainers guide for rclone #
 
-Current active maintainers of rclone are
+Current active maintainers of rclone are:
 
-  * Nick Craig-Wood @ncw
-  * Stefan Breunig @breunigs
-  * Ishuah Kariuki @ishuah
-  * Remus Bunduc @remusb - cache subsystem maintainer
-  * Fabian Möller @B4dM4n
+| Name             | GitHub ID   | Specific Responsibilities    |
+| :--------------- | :---------- | :--------------------------  |
+| Nick Craig-Wood  | @ncw        | overall project health       |
+| Stefan Breunig   | @breunigs   |                              |
+| Ishuah Kariuki   | @ishuah     |                              |
+| Remus Bunduc     | @remusb     | cache backend                |
+| Fabian Möller    | @B4dM4n     |                              |
+| Alex Chen        | @Cnly       | onedrive backend             |
+| Sandeep Ummadi   | @sandeepkru | azureblob backend            |
+| Sebastian Bünger | @buengese   | jottacloud & yandex backends |
+| Ivan Andreev     | @ivandeex   | chunker & mailru backends    |
+| Max Sum          | @Max-Sum    | union backend                |
 
 **This is a work in progress Draft**
 
@@ -46,7 +53,7 @@ The milestones have these meanings:
 * Help wanted - blue sky stuff that might get moved up, or someone could help with
 * Known bugs - bugs waiting on external factors or we aren't going to fix for the moment
 
-Tickets [with no milestone](https://github.com/ncw/rclone/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20no%3Amile) are good candidates for ones that have slipped between the gaps and need following up.
+Tickets [with no milestone](https://github.com/rclone/rclone/issues?utf8=✓&q=is%3Aissue%20is%3Aopen%20no%3Amile) are good candidates for ones that have slipped between the gaps and need following up.
 
 ## Closing Tickets ##
 
@@ -56,7 +63,7 @@ Close tickets as soon as you can - make sure they are tagged with a release.  Po
 
 Try to process pull requests promptly!
 
-Merging pull requests on Github itself works quite well now-a-days so you can squash and rebase or rebase pull requests.  rclone doesn't use merge commits.  Use the squash and rebase option if you need to edit the commit message.
+Merging pull requests on GitHub itself works quite well now-a-days so you can squash and rebase or rebase pull requests.  rclone doesn't use merge commits.  Use the squash and rebase option if you need to edit the commit message.
 
 After merging the commit, in your local master branch, do `git pull` then run `bin/update-authors.py` to update the authors file then `git push`.
 

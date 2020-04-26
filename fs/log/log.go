@@ -9,16 +9,25 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/rclone/rclone/fs"
 )
 
-// Flags
-var (
-	logFile        = flags.StringP("log-file", "", "", "Log everything to this file")
-	useSyslog      = flags.BoolP("syslog", "", false, "Use Syslog for logging")
-	syslogFacility = flags.StringP("syslog-facility", "", "DAEMON", "Facility for syslog, eg KERN,USER,...")
-)
+// Options contains options for the remote control server
+type Options struct {
+	File           string // Log everything to this file
+	Format         string // Comma separated list of log format options
+	UseSyslog      bool   // Use Syslog for logging
+	SyslogFacility string // Facility for syslog, eg KERN,USER,...
+}
+
+// DefaultOpt is the default values used for Opt
+var DefaultOpt = Options{
+	Format:         "date,time",
+	SyslogFacility: "DAEMON",
+}
+
+// Opt is the options for the logger
+var Opt = DefaultOpt
 
 // fnName returns the name of the calling +2 function
 func fnName() string {
@@ -64,11 +73,45 @@ func Trace(o interface{}, format string, a ...interface{}) func(string, ...inter
 	}
 }
 
+// Stack logs a stack trace of callers with the o and info passed in
+func Stack(o interface{}, info string) {
+	if fs.Config.LogLevel < fs.LogLevelDebug {
+		return
+	}
+	arr := [16 * 1024]byte{}
+	buf := arr[:]
+	n := runtime.Stack(buf, false)
+	buf = buf[:n]
+	fs.LogPrintf(fs.LogLevelDebug, o, "%s\nStack trace:\n%s", info, buf)
+}
+
 // InitLogging start the logging as per the command line flags
 func InitLogging() {
+	flagsStr := "," + Opt.Format + ","
+	var flags int
+	if strings.Contains(flagsStr, ",date,") {
+		flags |= log.Ldate
+	}
+	if strings.Contains(flagsStr, ",time,") {
+		flags |= log.Ltime
+	}
+	if strings.Contains(flagsStr, ",microseconds,") {
+		flags |= log.Lmicroseconds
+	}
+	if strings.Contains(flagsStr, ",longfile,") {
+		flags |= log.Llongfile
+	}
+	if strings.Contains(flagsStr, ",shortfile,") {
+		flags |= log.Lshortfile
+	}
+	if strings.Contains(flagsStr, ",UTC,") {
+		flags |= log.LUTC
+	}
+	log.SetFlags(flags)
+
 	// Log file output
-	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+	if Opt.File != "" {
+		f, err := os.OpenFile(Opt.File, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 		if err != nil {
 			log.Fatalf("Failed to open log file: %v", err)
 		}
@@ -81,10 +124,15 @@ func InitLogging() {
 	}
 
 	// Syslog output
-	if *useSyslog {
-		if *logFile != "" {
+	if Opt.UseSyslog {
+		if Opt.File != "" {
 			log.Fatalf("Can't use --syslog and --log-file together")
 		}
 		startSysLog()
 	}
+}
+
+// Redirected returns true if the log has been redirected from stdout
+func Redirected() bool {
+	return Opt.UseSyslog || Opt.File != ""
 }

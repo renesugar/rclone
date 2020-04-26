@@ -13,7 +13,7 @@ type Error struct {
 	} `json:"error"`
 }
 
-// Error statisfies the error interface
+// Error satisfies the error interface
 func (e *Error) Error() string {
 	return fmt.Sprintf("%s (Error %d)", e.Info.Message, e.Info.Code)
 }
@@ -211,4 +211,8 @@ type permissions struct {
 	SessionID    string `json:"session_id"`
 	FileID       string `json:"file_id"`
 	FileIsPublic int64  `json:"file_ispublic"`
+}
+
+type uploadFileChunkReply struct {
+	TotalWritten int64 `json:"TotalWritten"`
 }

@@ -1,14 +1,19 @@
 package vfs
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fstest"
+	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,16 +24,18 @@ func cleanup(t *testing.T, r *fstest.Run, vfs *VFS) {
 	r.Finalise()
 }
 
-// Open a file for write
-func rwHandleCreateReadOnly(t *testing.T, r *fstest.Run) (*VFS, *RWFileHandle) {
-	opt := DefaultOpt
-	opt.CacheMode = CacheModeFull
+// Create a file and open it with the flags passed in
+func rwHandleCreateFlags(t *testing.T, r *fstest.Run, create bool, filename string, flags int) (*VFS, *RWFileHandle) {
+	opt := vfscommon.DefaultOpt
+	opt.CacheMode = vfscommon.CacheModeFull
 	vfs := New(r.Fremote, &opt)
 
-	file1 := r.WriteObject("dir/file1", "0123456789abcdef", t1)
-	fstest.CheckItems(t, r.Fremote, file1)
+	if create {
+		file1 := r.WriteObject(context.Background(), filename, "0123456789abcdef", t1)
+		fstest.CheckItems(t, r.Fremote, file1)
+	}
 
-	h, err := vfs.OpenFile("dir/file1", os.O_RDONLY, 0777)
+	h, err := vfs.OpenFile(filename, flags, 0777)
 	require.NoError(t, err)
 	fh, ok := h.(*RWFileHandle)
 	require.True(t, ok)
@@ -36,18 +43,14 @@ func rwHandleCreateReadOnly(t *testing.T, r *fstest.Run) (*VFS, *RWFileHandle) {
 	return vfs, fh
 }
 
+// Open a file for read
+func rwHandleCreateReadOnly(t *testing.T, r *fstest.Run) (*VFS, *RWFileHandle) {
+	return rwHandleCreateFlags(t, r, true, "dir/file1", os.O_RDONLY)
+}
+
 // Open a file for write
 func rwHandleCreateWriteOnly(t *testing.T, r *fstest.Run) (*VFS, *RWFileHandle) {
-	opt := DefaultOpt
-	opt.CacheMode = CacheModeFull
-	vfs := New(r.Fremote, &opt)
-
-	h, err := vfs.OpenFile("file1", os.O_WRONLY|os.O_CREATE, 0777)
-	require.NoError(t, err)
-	fh, ok := h.(*RWFileHandle)
-	require.True(t, ok)
-
-	return vfs, fh
+	return rwHandleCreateFlags(t, r, false, "file1", os.O_WRONLY|os.O_CREATE)
 }
 
 // read data from the string
@@ -415,6 +418,10 @@ func TestRWFileHandleWriteNoWrite(t *testing.T) {
 
 	// Close the file without writing to it
 	err := fh.Close()
+	if errors.Cause(err) == fs.ErrorCantUploadEmptyFiles {
+		t.Logf("skipping test: %v", err)
+		return
+	}
 	assert.NoError(t, err)
 
 	// Create a different file (not in the cache)
@@ -451,13 +458,18 @@ func TestRWFileHandleFlushWrite(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 5, n)
 
-	// Check Flush closes file if write called
+	// Check Flush does not close file if write called
 	err = fh.Flush()
 	assert.NoError(t, err)
-	assert.True(t, fh.closed)
+	assert.False(t, fh.closed)
 
 	// Check flush does nothing if called again
 	err = fh.Flush()
+	assert.NoError(t, err)
+	assert.False(t, fh.closed)
+
+	// Check that Close closes the file
+	err = fh.Close()
 	assert.NoError(t, err)
 	assert.True(t, fh.closed)
 }
@@ -481,6 +493,96 @@ func TestRWFileHandleReleaseWrite(t *testing.T) {
 	err = fh.Release()
 	assert.NoError(t, err)
 	assert.True(t, fh.closed)
+}
+
+// check the size of the file through the open file (if not nil) and via stat
+func assertSize(t *testing.T, vfs *VFS, fh *RWFileHandle, filepath string, size int64) {
+	if fh != nil {
+		assert.Equal(t, size, fh.Size())
+	}
+	fi, err := vfs.Stat(filepath)
+	require.NoError(t, err)
+	assert.Equal(t, size, fi.Size())
+}
+
+func TestRWFileHandleSizeTruncateExisting(t *testing.T) {
+	r := fstest.NewRun(t)
+	vfs, fh := rwHandleCreateFlags(t, r, true, "dir/file1", os.O_WRONLY|os.O_TRUNC)
+	defer cleanup(t, r, vfs)
+
+	// check initial size after opening
+	assertSize(t, vfs, fh, "dir/file1", 0)
+
+	// write some bytes
+	n, err := fh.Write([]byte("hello"))
+	assert.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	// check size after writing
+	assertSize(t, vfs, fh, "dir/file1", 5)
+
+	// close
+	assert.NoError(t, fh.Close())
+
+	// check size after close
+	assertSize(t, vfs, nil, "dir/file1", 5)
+}
+
+func TestRWFileHandleSizeCreateExisting(t *testing.T) {
+	r := fstest.NewRun(t)
+	vfs, fh := rwHandleCreateFlags(t, r, true, "dir/file1", os.O_WRONLY|os.O_CREATE)
+	defer cleanup(t, r, vfs)
+
+	// check initial size after opening
+	assertSize(t, vfs, fh, "dir/file1", 16)
+
+	// write some bytes
+	n, err := fh.Write([]byte("hello"))
+	assert.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	// check size after writing
+	assertSize(t, vfs, fh, "dir/file1", 16)
+
+	// write some more bytes
+	n, err = fh.Write([]byte("helloHELLOhello"))
+	assert.NoError(t, err)
+	assert.Equal(t, 15, n)
+
+	// check size after writing
+	assertSize(t, vfs, fh, "dir/file1", 20)
+
+	// close
+	assert.NoError(t, fh.Close())
+
+	// check size after close
+	assertSize(t, vfs, nil, "dir/file1", 20)
+}
+
+func TestRWFileHandleSizeCreateNew(t *testing.T) {
+	r := fstest.NewRun(t)
+	vfs, fh := rwHandleCreateFlags(t, r, false, "file1", os.O_WRONLY|os.O_CREATE)
+	defer cleanup(t, r, vfs)
+
+	// check initial size after opening
+	assertSize(t, vfs, fh, "file1", 0)
+
+	// write some bytes
+	n, err := fh.Write([]byte("hello"))
+	assert.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	// check size after writing
+	assertSize(t, vfs, fh, "file1", 5)
+
+	// check size after writing
+	assertSize(t, vfs, fh, "file1", 5)
+
+	// close
+	assert.NoError(t, fh.Close())
+
+	// check size after close
+	assertSize(t, vfs, nil, "file1", 5)
 }
 
 func testRWFileHandleOpenTest(t *testing.T, vfs *VFS, test *openTest) {
@@ -560,8 +662,8 @@ func testRWFileHandleOpenTest(t *testing.T, vfs *VFS, test *openTest) {
 
 func TestRWFileHandleOpenTests(t *testing.T) {
 	r := fstest.NewRun(t)
-	opt := DefaultOpt
-	opt.CacheMode = CacheModeFull
+	opt := vfscommon.DefaultOpt
+	opt.CacheMode = vfscommon.CacheModeFull
 	vfs := New(r.Fremote, &opt)
 	defer cleanup(t, r, vfs)
 
@@ -574,9 +676,12 @@ func TestRWFileHandleOpenTests(t *testing.T) {
 func TestRWFileModTimeWithOpenWriters(t *testing.T) {
 	r := fstest.NewRun(t)
 	defer r.Finalise()
+	if !canSetModTime(t, r) {
+		return
+	}
 	vfs, fh := rwHandleCreateWriteOnly(t, r)
 
-	mtime := time.Date(2012, 11, 18, 17, 32, 31, 0, time.UTC)
+	mtime := time.Date(2012, time.November, 18, 17, 32, 31, 0, time.UTC)
 
 	_, err := fh.Write([]byte{104, 105})
 	require.NoError(t, err)
@@ -584,12 +689,55 @@ func TestRWFileModTimeWithOpenWriters(t *testing.T) {
 	err = fh.Node().SetModTime(mtime)
 	require.NoError(t, err)
 
-	err = fh.Close()
+	// Using Flush/Release to mimic mount instead of Close
+
+	err = fh.Flush()
+	require.NoError(t, err)
+
+	err = fh.Release()
 	require.NoError(t, err)
 
 	info, err := vfs.Stat("file1")
 	require.NoError(t, err)
 
-	// avoid errors because of timezone differences
-	assert.Equal(t, info.ModTime().Unix(), mtime.Unix())
+	if r.Fremote.Precision() != fs.ModTimeNotSupported {
+		// avoid errors because of timezone differences
+		assert.Equal(t, info.ModTime().Unix(), mtime.Unix(), fmt.Sprintf("Time mismatch: %v != %v", info.ModTime(), mtime))
+	}
+
+	file1 := fstest.NewItem("file1", "hi", mtime)
+	fstest.CheckItems(t, r.Fremote, file1)
+}
+
+func TestRWCacheRename(t *testing.T) {
+	r := fstest.NewRun(t)
+	defer r.Finalise()
+
+	if !operations.CanServerSideMove(r.Fremote) {
+		t.Skip("skip as can't rename files")
+	}
+
+	opt := vfscommon.DefaultOpt
+	opt.CacheMode = vfscommon.CacheModeFull
+	vfs := New(r.Fremote, &opt)
+
+	h, err := vfs.OpenFile("rename_me", os.O_WRONLY|os.O_CREATE, 0777)
+	require.NoError(t, err)
+	_, err = h.WriteString("hello")
+	require.NoError(t, err)
+	fh, ok := h.(*RWFileHandle)
+	require.True(t, ok)
+
+	err = fh.Sync()
+	require.NoError(t, err)
+	err = fh.Close()
+	require.NoError(t, err)
+
+	assert.True(t, vfs.cache.Exists("rename_me"))
+
+	err = vfs.Rename("rename_me", "i_was_renamed")
+	require.NoError(t, err)
+
+	assert.False(t, vfs.cache.Exists("rename_me"))
+	assert.True(t, vfs.cache.Exists("i_was_renamed"))
 }

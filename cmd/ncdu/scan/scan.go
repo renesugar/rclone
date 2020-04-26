@@ -2,12 +2,13 @@
 package scan
 
 import (
+	"context"
 	"path"
 	"sync"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/walk"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/walk"
 )
 
 // Dir represents a directory found in the remote
@@ -70,6 +71,45 @@ func (d *Dir) Entries() fs.DirEntries {
 	return append(fs.DirEntries(nil), d.entries...)
 }
 
+// Remove removes the i-th entry from the
+// in-memory representation of the remote directory
+func (d *Dir) Remove(i int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.remove(i)
+}
+
+// removes the i-th entry from the
+// in-memory representation of the remote directory
+//
+// Call with d.mu held
+func (d *Dir) remove(i int) {
+	size := d.entries[i].Size()
+	count := int64(1)
+
+	subDir, ok := d.getDir(i)
+	if ok {
+		size = subDir.size
+		count = subDir.count
+		delete(d.dirs, path.Base(subDir.path))
+	}
+
+	d.size -= size
+	d.count -= count
+	d.entries = append(d.entries[:i], d.entries[i+1:]...)
+
+	dir := d
+	// populate changed size and count to parent(s)
+	for parent := d.parent; parent != nil; parent = parent.parent {
+		parent.mu.Lock()
+		parent.dirs[path.Base(dir.path)] = dir
+		parent.size -= size
+		parent.count -= count
+		dir = parent
+		parent.mu.Unlock()
+	}
+}
+
 // gets the directory of the i-th entry
 //
 // returns nil if it is a file
@@ -121,13 +161,13 @@ func (d *Dir) AttrI(i int) (size int64, count int64, isDir bool, readable bool) 
 
 // Scan the Fs passed in, returning a root directory channel and an
 // error channel
-func Scan(f fs.Fs) (chan *Dir, chan error, chan struct{}) {
+func Scan(ctx context.Context, f fs.Fs) (chan *Dir, chan error, chan struct{}) {
 	root := make(chan *Dir, 1)
 	errChan := make(chan error, 1)
 	updated := make(chan struct{}, 1)
 	go func() {
 		parents := map[string]*Dir{}
-		err := walk.Walk(f, "", false, fs.Config.MaxDepth, func(dirPath string, entries fs.DirEntries, err error) error {
+		err := walk.Walk(ctx, f, "", false, fs.Config.MaxDepth, func(dirPath string, entries fs.DirEntries, err error) error {
 			if err != nil {
 				return err // FIXME mark directory as errored instead of aborting
 			}

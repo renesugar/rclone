@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncw/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
 // Error describes a B2 error response
@@ -17,12 +17,12 @@ type Error struct {
 	Message string `json:"message"` // A human-readable message, in English, saying what went wrong.
 }
 
-// Error statisfies the error interface
+// Error satisfies the error interface
 func (e *Error) Error() string {
 	return fmt.Sprintf("%s (%d %s)", e.Message, e.Status, e.Code)
 }
 
-// Fatal statisfies the Fatal interface
+// Fatal satisfies the Fatal interface
 //
 // It indicates which errors should be treated as fatal
 func (e *Error) Fatal() bool {
@@ -30,11 +30,6 @@ func (e *Error) Fatal() bool {
 }
 
 var _ fserrors.Fataler = (*Error)(nil)
-
-// Account describes a B2 account
-type Account struct {
-	ID string `json:"accountId"` // The identifier for the account.
-}
 
 // Bucket describes a B2 bucket
 type Bucket struct {
@@ -55,7 +50,7 @@ type Timestamp time.Time
 // MarshalJSON turns a Timestamp into JSON (in UTC)
 func (t *Timestamp) MarshalJSON() (out []byte, err error) {
 	timestamp := (*time.Time)(t).UTC().UnixNano()
-	return []byte(strconv.FormatInt(timestamp/1E6, 10)), nil
+	return []byte(strconv.FormatInt(timestamp/1e6, 10)), nil
 }
 
 // UnmarshalJSON turns JSON into a Timestamp
@@ -64,7 +59,7 @@ func (t *Timestamp) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	*t = Timestamp(time.Unix(timestamp/1E3, (timestamp%1E3)*1E6).UTC())
+	*t = Timestamp(time.Unix(timestamp/1e3, (timestamp%1e3)*1e6).UTC())
 	return nil
 }
 
@@ -74,7 +69,7 @@ const versionFormat = "-v2006-01-02-150405.000"
 func (t Timestamp) AddVersion(remote string) string {
 	ext := path.Ext(remote)
 	base := remote[:len(remote)-len(ext)]
-	s := (time.Time)(t).Format(versionFormat)
+	s := time.Time(t).Format(versionFormat)
 	// Replace the '.' with a '-'
 	s = strings.Replace(s, ".", "-", -1)
 	return base + s + ext
@@ -105,22 +100,22 @@ func RemoveVersion(remote string) (t Timestamp, newRemote string) {
 	return Timestamp(newT), base[:versionStart] + ext
 }
 
-// IsZero returns true if the timestamp is unitialised
+// IsZero returns true if the timestamp is uninitialized
 func (t Timestamp) IsZero() bool {
-	return (time.Time)(t).IsZero()
+	return time.Time(t).IsZero()
 }
 
 // Equal compares two timestamps
 //
 // If either are !IsZero then it returns false
 func (t Timestamp) Equal(s Timestamp) bool {
-	if (time.Time)(t).IsZero() {
+	if time.Time(t).IsZero() {
 		return false
 	}
-	if (time.Time)(s).IsZero() {
+	if time.Time(s).IsZero() {
 		return false
 	}
-	return (time.Time)(t).Equal((time.Time)(s))
+	return time.Time(t).Equal(time.Time(s))
 }
 
 // File is info about a file
@@ -137,10 +132,27 @@ type File struct {
 
 // AuthorizeAccountResponse is as returned from the b2_authorize_account call
 type AuthorizeAccountResponse struct {
-	AccountID          string `json:"accountId"`          // The identifier for the account.
-	AuthorizationToken string `json:"authorizationToken"` // An authorization token to use with all calls, other than b2_authorize_account, that need an Authorization header.
-	APIURL             string `json:"apiUrl"`             // The base URL to use for all API calls except for uploading and downloading files.
-	DownloadURL        string `json:"downloadUrl"`        // The base URL to use for downloading files.
+	AbsoluteMinimumPartSize int      `json:"absoluteMinimumPartSize"` // The smallest possible size of a part of a large file.
+	AccountID               string   `json:"accountId"`               // The identifier for the account.
+	Allowed                 struct { // An object (see below) containing the capabilities of this auth token, and any restrictions on using it.
+		BucketID     string      `json:"bucketId"`     // When present, access is restricted to one bucket.
+		BucketName   string      `json:"bucketName"`   // When present, name of bucket - may be empty
+		Capabilities []string    `json:"capabilities"` // A list of strings, each one naming a capability the key has.
+		NamePrefix   interface{} `json:"namePrefix"`   // When present, access is restricted to files whose names start with the prefix
+	} `json:"allowed"`
+	APIURL              string `json:"apiUrl"`              // The base URL to use for all API calls except for uploading and downloading files.
+	AuthorizationToken  string `json:"authorizationToken"`  // An authorization token to use with all calls, other than b2_authorize_account, that need an Authorization header.
+	DownloadURL         string `json:"downloadUrl"`         // The base URL to use for downloading files.
+	MinimumPartSize     int    `json:"minimumPartSize"`     // DEPRECATED: This field will always have the same value as recommendedPartSize. Use recommendedPartSize instead.
+	RecommendedPartSize int    `json:"recommendedPartSize"` // The recommended size for each part of a large file. We recommend using this part size for optimal upload performance.
+}
+
+// ListBucketsRequest is parameters for b2_list_buckets call
+type ListBucketsRequest struct {
+	AccountID   string   `json:"accountId"`             // The identifier for the account.
+	BucketID    string   `json:"bucketId,omitempty"`    // When specified, the result will be a list containing just this bucket.
+	BucketName  string   `json:"bucketName,omitempty"`  // When specified, the result will be a list containing just this bucket.
+	BucketTypes []string `json:"bucketTypes,omitempty"` // If present, B2 will use it as a filter for bucket types returned in the list buckets response.
 }
 
 // ListBucketsResponse is as returned from the b2_list_buckets call
@@ -175,6 +187,21 @@ type GetUploadURLResponse struct {
 	BucketID           string `json:"bucketId"`           // The unique ID of the bucket.
 	UploadURL          string `json:"uploadUrl"`          // The URL that can be used to upload files to this bucket, see b2_upload_file.
 	AuthorizationToken string `json:"authorizationToken"` // The authorizationToken that must be used when uploading files to this bucket, see b2_upload_file.
+}
+
+// GetDownloadAuthorizationRequest is passed to b2_get_download_authorization
+type GetDownloadAuthorizationRequest struct {
+	BucketID               string `json:"bucketId"`                       // The ID of the bucket that you want to upload to.
+	FileNamePrefix         string `json:"fileNamePrefix"`                 // The file name prefix of files the download authorization token will allow access to.
+	ValidDurationInSeconds int64  `json:"validDurationInSeconds"`         // The number of seconds before the authorization token will expire. The minimum value is 1 second. The maximum value is 604800 which is one week in seconds.
+	B2ContentDisposition   string `json:"b2ContentDisposition,omitempty"` // optional - If this is present, download requests using the returned authorization must include the same value for b2ContentDisposition.
+}
+
+// GetDownloadAuthorizationResponse is received from b2_get_download_authorization
+type GetDownloadAuthorizationResponse struct {
+	BucketID           string `json:"bucketId"`           // The unique ID of the bucket.
+	FileNamePrefix     string `json:"fileNamePrefix"`     // The file name prefix of files the download authorization token will allow access to.
+	AuthorizationToken string `json:"authorizationToken"` // The authorizationToken that must be used when downloading files, see b2_download_file_by_name.
 }
 
 // FileInfo is received from b2_upload_file, b2_get_file_info and b2_finish_large_file
@@ -298,4 +325,15 @@ type CancelLargeFileResponse struct {
 	Name      string `json:"fileName"`  // The name of this file.
 	AccountID string `json:"accountId"` // The identifier for the account.
 	BucketID  string `json:"bucketId"`  // The unique ID of the bucket.
+}
+
+// CopyFileRequest is as passed to b2_copy_file
+type CopyFileRequest struct {
+	SourceID          string            `json:"sourceFileId"`                  // The ID of the source file being copied.
+	Name              string            `json:"fileName"`                      // The name of the new file being created.
+	Range             string            `json:"range,omitempty"`               // The range of bytes to copy. If not provided, the whole source file will be copied.
+	MetadataDirective string            `json:"metadataDirective,omitempty"`   // The strategy for how to populate metadata for the new file: COPY or REPLACE
+	ContentType       string            `json:"contentType,omitempty"`         // The MIME type of the content of the file (REPLACE only)
+	Info              map[string]string `json:"fileInfo,omitempty"`            // This field stores the metadata that will be stored with the file. (REPLACE only)
+	DestBucketID      string            `json:"destinationBucketId,omitempty"` // The destination ID of the bucket if set, if not the source bucket will be used
 }

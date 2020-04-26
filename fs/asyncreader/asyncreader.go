@@ -5,22 +5,24 @@ package asyncreader
 import (
 	"io"
 	"sync"
+	"time"
 
-	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/pool"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 const (
 	// BufferSize is the default size of the async buffer
-	BufferSize       = 1024 * 1024
-	softStartInitial = 4 * 1024
+	BufferSize           = 1024 * 1024
+	softStartInitial     = 4 * 1024
+	bufferCacheSize      = 64              // max number of buffers to keep in cache
+	bufferCacheFlushTime = 5 * time.Second // flush the cached buffers after this long
 )
 
-var asyncBufferPool = sync.Pool{
-	New: func() interface{} { return newBuffer() },
-}
-
-var errorStreamAbandoned = errors.New("stream abandoned")
+// ErrorStreamAbandoned is returned when the input is closed before the end of the stream
+var ErrorStreamAbandoned = errors.New("stream abandoned")
 
 // AsyncReader will do async read-ahead from the input reader
 // and make the data available as an io.Reader.
@@ -98,16 +100,25 @@ func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
 	}()
 }
 
+// bufferPool is a global pool of buffers
+var bufferPool *pool.Pool
+var bufferPoolOnce sync.Once
+
 // return the buffer to the pool (clearing it)
 func (a *AsyncReader) putBuffer(b *buffer) {
-	b.clear()
-	asyncBufferPool.Put(b)
+	bufferPool.Put(b.buf)
+	b.buf = nil
 }
 
 // get a buffer from the pool
 func (a *AsyncReader) getBuffer() *buffer {
-	b := asyncBufferPool.Get().(*buffer)
-	return b
+	bufferPoolOnce.Do(func() {
+		// Initialise the buffer pool when used
+		bufferPool = pool.New(bufferCacheFlushTime, BufferSize, bufferCacheSize, fs.Config.UseMmap)
+	})
+	return &buffer{
+		buf: bufferPool.Get(),
+	}
 }
 
 // Read will return the next available data.
@@ -122,7 +133,7 @@ func (a *AsyncReader) fill() (err error) {
 		if !ok {
 			// Return an error to show fill failed
 			if a.err == nil {
-				return errorStreamAbandoned
+				return ErrorStreamAbandoned
 			}
 			return a.err
 		}
@@ -164,6 +175,9 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 	n = 0
 	for {
 		err = a.fill()
+		if err == io.EOF {
+			return n, nil
+		}
 		if err != nil {
 			return n, err
 		}
@@ -173,9 +187,83 @@ func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
 		if err != nil {
 			return n, err
 		}
+		if a.cur.err == io.EOF {
+			a.err = a.cur.err
+			return n, err
+		}
 		if a.cur.err != nil {
 			a.err = a.cur.err
 			return n, a.cur.err
+		}
+	}
+}
+
+// SkipBytes will try to seek 'skip' bytes relative to the current position.
+// On success it returns true. If 'skip' is outside the current buffer data or
+// an error occurs, Abandon is called and false is returned.
+func (a *AsyncReader) SkipBytes(skip int) (ok bool) {
+	a.mu.Lock()
+	defer func() {
+		a.mu.Unlock()
+		if !ok {
+			a.Abandon()
+		}
+	}()
+
+	if a.err != nil {
+		return false
+	}
+	if skip < 0 {
+		// seek backwards if skip is inside current buffer
+		if a.cur != nil && a.cur.offset+skip >= 0 {
+			a.cur.offset += skip
+			return true
+		}
+		return false
+	}
+	// early return if skip is past the maximum buffer capacity
+	if skip >= (len(a.ready)+1)*BufferSize {
+		return false
+	}
+
+	refillTokens := 0
+	for {
+		if a.cur.isEmpty() {
+			if a.cur != nil {
+				a.putBuffer(a.cur)
+				refillTokens++
+				a.cur = nil
+			}
+			select {
+			case b, ok := <-a.ready:
+				if !ok {
+					return false
+				}
+				a.cur = b
+			default:
+				return false
+			}
+		}
+
+		n := len(a.cur.buffer())
+		if n > skip {
+			n = skip
+		}
+		a.cur.increment(n)
+		skip -= n
+		if skip == 0 {
+			for ; refillTokens > 0; refillTokens-- {
+				a.token <- struct{}{}
+			}
+			// If at end of buffer, store any error, if present
+			if a.cur.isEmpty() && a.cur.err != nil {
+				a.err = a.cur.err
+			}
+			return true
+		}
+		if a.cur.err != nil {
+			a.err = a.cur.err
+			return false
 		}
 	}
 }
@@ -223,20 +311,6 @@ type buffer struct {
 	buf    []byte
 	err    error
 	offset int
-}
-
-func newBuffer() *buffer {
-	return &buffer{
-		buf: make([]byte, BufferSize),
-		err: nil,
-	}
-}
-
-// clear returns the buffer to its full size and clears the members
-func (b *buffer) clear() {
-	b.buf = b.buf[:cap(b.buf)]
-	b.err = nil
-	b.offset = 0
 }
 
 // isEmpty returns true is offset is at end of

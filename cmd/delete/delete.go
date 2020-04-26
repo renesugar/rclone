@@ -1,21 +1,27 @@
 package delete
 
 import (
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/operations"
+	"context"
+
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "delete remote:path",
 	Short: `Remove the contents of path.`,
 	Long: `
-Remove the contents of path.  Unlike ` + "`" + `purge` + "`" + ` it obeys include/exclude
+Remove the files in path.  Unlike ` + "`" + `purge` + "`" + ` it obeys include/exclude
 filters so can be used to selectively delete files.
+
+` + "`" + `rclone delete` + "`" + ` only deletes objects but leaves the directory structure
+alone. If you want to delete a directory and all of its contents use
+` + "`" + `rclone purge` + "`" + `
 
 Eg delete all files bigger than 100MBytes
 
@@ -35,7 +41,7 @@ delete all files bigger than 100MBytes.
 		cmd.CheckArgs(1, 1, command, args)
 		fsrc := cmd.NewFsSrc(args)
 		cmd.Run(true, false, command, func() error {
-			return operations.Delete(fsrc)
+			return operations.Delete(context.Background(), fsrc)
 		})
 	},
 }

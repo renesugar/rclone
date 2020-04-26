@@ -1,4 +1,5 @@
-// +build !plan9,!windows
+// +build linux,go1.13 darwin,go1.13 freebsd,go1.13
+// +build !race
 
 package cache_test
 
@@ -9,9 +10,9 @@ import (
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/cmd/mount"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/cmd/mount"
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
 	"github.com/stretchr/testify/require"
 )
 

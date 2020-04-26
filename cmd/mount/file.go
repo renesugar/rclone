@@ -1,17 +1,16 @@
-// +build linux darwin freebsd
+// +build linux,go1.13 darwin,go1.13 freebsd,go1.13
 
 package mount
 
 import (
-	"io"
+	"context"
 	"time"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 // File represents a file
@@ -74,9 +73,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		return nil, translateError(err)
 	}
 
-	// See if seeking is supported and set FUSE hint accordingly
-	if _, err = handle.Seek(0, io.SeekCurrent); err != nil {
-		resp.Flags |= fuse.OpenNonSeekable
+	// If size unknown then use direct io to read
+	if entry := handle.Node().DirEntry(); entry != nil && entry.Size() < 0 {
+		resp.Flags |= fuse.OpenDirectIO
 	}
 
 	return &FileHandle{handle}, nil

@@ -9,7 +9,9 @@ Using the ` + "`--dir-cache-time`" + ` flag, you can set how long a
 directory should be considered up to date and not refreshed from the
 backend. Changes made locally in the mount may appear immediately or
 invalidate the cache. However, changes done on the remote will only
-be picked up once the cache expires.
+be picked up once the cache expires if the backend configured does not
+support polling for changes. If the backend supports polling, changes
+will be picked up on within the polling interval.
 
 Alternatively, you can send a ` + "`SIGHUP`" + ` signal to rclone for
 it to flush all directory caches, regardless of how old they are.
@@ -27,9 +29,24 @@ Or individual files or directories:
 
     rclone rc vfs/forget file=path/to/file dir=path/to/dir
 
-### File Caching
+### File Buffering
 
-**NB** File caching is **EXPERIMENTAL** - use with care!
+The ` + "`--buffer-size`" + ` flag determines the amount of memory,
+that will be used to buffer data in advance.
+
+Each open file descriptor will try to keep the specified amount of
+data in memory at all times. The buffered data is bound to one file
+descriptor and won't be shared between multiple open file descriptors
+of the same file.
+
+This flag is a upper limit for the used memory per file descriptor.
+The buffer will only use memory for data that is downloaded but not
+not yet read. If the buffer is empty, only a small amount of memory
+will be used.
+The maximum memory used by rclone for buffering can be up to
+` + "`--buffer-size * open files`" + `.
+
+### File Caching
 
 These flags control the VFS file caching options.  The VFS layer is
 used by rclone mount to make a cloud storage system work more like a
@@ -45,6 +62,7 @@ may find that you need one or the other or both.
     --vfs-cache-max-age duration         Max age of objects in the cache. (default 1h0m0s)
     --vfs-cache-mode string              Cache mode off|minimal|writes|full (default "off")
     --vfs-cache-poll-interval duration   Interval to poll the cache for stale objects. (default 1m0s)
+    --vfs-cache-max-size int             Max total size of objects in the cache. (default off)
 
 If run with ` + "`-vv`" + ` rclone will print the location of the file cache.  The
 files are stored in the user cache file area which is OS dependent but
@@ -59,6 +77,11 @@ Note that files are written back to the remote only when they are
 closed so if rclone is quit or dies with open files then these won't
 get written back to the remote.  However they will still be in the on
 disk cache.
+
+If using --vfs-cache-max-size note that the cache may exceed this size
+for two reasons.  Firstly because it is only checked every
+--vfs-cache-poll-interval.  Secondly because open files cannot be
+evicted from the cache.
 
 #### --vfs-cache-mode off
 
@@ -115,4 +138,40 @@ This mode should support all normal file system operations.
 
 If an upload or download fails it will be retried up to
 --low-level-retries times.
+
+### Case Sensitivity
+
+Linux file systems are case-sensitive: two files can differ only
+by case, and the exact case must be used when opening a file.
+
+Windows is not like most other operating systems supported by rclone.
+File systems in modern Windows are case-insensitive but case-preserving:
+although existing files can be opened using any case, the exact case used
+to create the file is preserved and available for programs to query.
+It is not allowed for two files in the same directory to differ only by case.
+
+Usually file systems on MacOS are case-insensitive. It is possible to make MacOS
+file systems case-sensitive but that is not the default
+
+The "--vfs-case-insensitive" mount flag controls how rclone handles these
+two cases. If its value is "false", rclone passes file names to the mounted
+file system as is. If the flag is "true" (or appears without a value on
+command line), rclone may perform a "fixup" as explained below.
+
+The user may specify a file name to open/delete/rename/etc with a case
+different than what is stored on mounted file system. If an argument refers
+to an existing file with exactly the same name, then the case of the existing
+file on the disk will be used. However, if a file name with exactly the same
+name is not found but a name differing only by case exists, rclone will
+transparently fixup the name. This fixup happens only when an existing file
+is requested. Case sensitivity of file names created anew by rclone is
+controlled by an underlying mounted file system.
+
+Note that case sensitivity of the operating system running rclone (the target)
+may differ from case sensitivity of a file system mounted by rclone (the source).
+The flag controls whether "fixup" is performed to satisfy the target.
+
+If the flag is not provided on command line, then its default value depends
+on the operating system where rclone runs: "true" on Windows and MacOS, "false"
+otherwise. If the flag is provided without a value, then it is "true".
 `

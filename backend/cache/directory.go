@@ -3,16 +3,16 @@
 package cache
 
 import (
+	"context"
+	"path"
 	"time"
 
-	"path"
-
-	"github.com/ncw/rclone/fs"
+	"github.com/rclone/rclone/fs"
 )
 
 // Directory is a generic dir that stores basic information about it
 type Directory struct {
-	fs.Directory `json:"-"`
+	Directory fs.Directory `json:"-"` // can be nil
 
 	CacheFs      *Fs    `json:"-"`       // cache fs
 	Name         string `json:"name"`    // name of the directory
@@ -56,7 +56,7 @@ func ShallowDirectory(f *Fs, remote string) *Directory {
 }
 
 // DirectoryFromOriginal builds one from a generic fs.Directory
-func DirectoryFromOriginal(f *Fs, d fs.Directory) *Directory {
+func DirectoryFromOriginal(ctx context.Context, f *Fs, d fs.Directory) *Directory {
 	var cd *Directory
 	fullRemote := path.Join(f.Root(), d.Remote())
 
@@ -68,7 +68,7 @@ func DirectoryFromOriginal(f *Fs, d fs.Directory) *Directory {
 		CacheFs:      f,
 		Name:         name,
 		Dir:          dir,
-		CacheModTime: d.ModTime().UnixNano(),
+		CacheModTime: d.ModTime(ctx).UnixNano(),
 		CacheSize:    d.Size(),
 		CacheItems:   d.Items(),
 		CacheType:    "Directory",
@@ -101,17 +101,8 @@ func (d *Directory) abs() string {
 	return cleanPath(path.Join(d.Dir, d.Name))
 }
 
-// parentRemote returns the absolute path parent remote
-func (d *Directory) parentRemote() string {
-	absPath := d.abs()
-	if absPath == "" {
-		return ""
-	}
-	return cleanPath(path.Dir(absPath))
-}
-
 // ModTime returns the cached ModTime
-func (d *Directory) ModTime() time.Time {
+func (d *Directory) ModTime(ctx context.Context) time.Time {
 	return time.Unix(0, d.CacheModTime)
 }
 
@@ -123,6 +114,14 @@ func (d *Directory) Size() int64 {
 // Items returns the cached Items
 func (d *Directory) Items() int64 {
 	return d.CacheItems
+}
+
+// ID returns the ID of the cached directory if known
+func (d *Directory) ID() string {
+	if d.Directory == nil {
+		return ""
+	}
+	return d.Directory.ID()
 }
 
 var (

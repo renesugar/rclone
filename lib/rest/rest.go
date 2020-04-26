@@ -5,6 +5,7 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"io"
@@ -14,8 +15,9 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/ncw/rclone/fs"
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // Client contains the info to sustain the API
@@ -45,7 +47,7 @@ func ReadBody(resp *http.Response) (result []byte, err error) {
 }
 
 // defaultErrorHandler doesn't attempt to parse the http body, just
-// returns it in the error message
+// returns it in the error message closing resp.Body
 func defaultErrorHandler(resp *http.Response) (err error) {
 	body, err := ReadBody(resp)
 	if err != nil {
@@ -73,6 +75,7 @@ func (api *Client) SetRoot(RootURL string) *Client {
 }
 
 // SetHeader sets a header for all requests
+// Start the key with "*" for don't canonicalise
 func (api *Client) SetHeader(key, value string) *Client {
 	api.mu.Lock()
 	defer api.mu.Unlock()
@@ -131,9 +134,9 @@ type Opts struct {
 	ContentType           string
 	ContentLength         *int64
 	ContentRange          string
-	ExtraHeaders          map[string]string
-	UserName              string // username for Basic Auth
-	Password              string // password for Basic Auth
+	ExtraHeaders          map[string]string // extra headers, start them with "*" for don't canonicalise
+	UserName              string            // username for Basic Auth
+	Password              string            // password for Basic Auth
 	Options               []fs.OpenOption
 	IgnoreStatus          bool       // if set then we don't check error status or parse error body
 	MultipartParams       url.Values // if set do multipart form upload with attached file
@@ -143,6 +146,7 @@ type Opts struct {
 	Parameters            url.Values // any parameters for the final URL
 	TransferEncoding      []string   // transfer encoding, set to "identity" to disable chunked encoding
 	Close                 bool       // set to close the connection after this transaction
+	NoRedirect            bool       // if this is set then the client won't follow redirects
 }
 
 // Copy creates a copy of the options
@@ -165,36 +169,24 @@ func DecodeXML(resp *http.Response, result interface{}) (err error) {
 	return decoder.Decode(result)
 }
 
-// ClientWithHeaderReset makes a new http client which resets the
-// headers passed in on redirect
-//
-// FIXME This is now unecessary with go1.8
-func ClientWithHeaderReset(c *http.Client, headers map[string]string) *http.Client {
-	if len(headers) == 0 {
-		return c
-	}
+// ClientWithNoRedirects makes a new http client which won't follow redirects
+func ClientWithNoRedirects(c *http.Client) *http.Client {
 	clientCopy := *c
 	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		// Reset the headers in the new request
-		for k, v := range headers {
-			if v != "" {
-				req.Header.Set(k, v)
-			}
-		}
-		return nil
+		return http.ErrUseLastResponse
 	}
 	return &clientCopy
 }
 
 // Call makes the call and returns the http.Response
 //
-// if err != nil then resp.Body will need to be closed
+// if err == nil then resp.Body will need to be closed unless
+// opt.NoResponse is set
+//
+// if err != nil then resp.Body will have been closed
 //
 // it will return resp if at all possible, even if err is set
-func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
+func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, err error) {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	if opts == nil {
@@ -211,10 +203,21 @@ func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
 	if opts.Parameters != nil && len(opts.Parameters) > 0 {
 		url += "?" + opts.Parameters.Encode()
 	}
-	req, err := http.NewRequest(opts.Method, url, opts.Body)
+	body := readers.NoCloser(opts.Body)
+	// If length is set and zero then nil out the body to stop use
+	// use of chunked encoding and insert a "Content-Length: 0"
+	// header.
+	//
+	// If we don't do this we get "Content-Length" headers for all
+	// files except 0 length files.
+	if opts.ContentLength != nil && *opts.ContentLength == 0 {
+		body = nil
+	}
+	req, err := http.NewRequest(opts.Method, url, body)
 	if err != nil {
 		return
 	}
+	req = req.WithContext(ctx) // go1.13 can use NewRequestWithContext
 	headers := make(map[string]string)
 	// Set default headers
 	for k, v := range api.headers {
@@ -245,16 +248,30 @@ func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
 	fs.OpenOptionAddHeaders(opts.Options, headers)
 	// Now set the headers
 	for k, v := range headers {
-		if v != "" {
-			req.Header.Add(k, v)
+		if k != "" && v != "" {
+			if k[0] == '*' {
+				// Add non-canonical version if header starts with *
+				k = k[1:]
+				req.Header[k] = append(req.Header[k], v)
+			} else {
+				req.Header.Add(k, v)
+			}
 		}
 	}
+
 	if opts.UserName != "" || opts.Password != "" {
 		req.SetBasicAuth(opts.UserName, opts.Password)
 	}
-	c := ClientWithHeaderReset(api.c, headers)
+	var c *http.Client
+	if opts.NoRedirect {
+		c = ClientWithNoRedirects(api.c)
+	} else {
+		c = api.c
+	}
 	if api.signer != nil {
+		api.mu.RUnlock()
 		err = api.signer(req)
+		api.mu.RLock()
 		if err != nil {
 			return nil, errors.Wrap(err, "signer failed")
 		}
@@ -284,16 +301,48 @@ func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
 // MultipartUpload creates an io.Reader which produces an encoded a
 // multipart form upload from the params passed in and the  passed in
 //
-// in - the body of the file
+// in - the body of the file (may be nil)
 // params - the form parameters
 // fileName - is the name of the attached file
 // contentName - the name of the parameter for the file
 //
+// the int64 returned is the overhead in addition to the file contents, in case Content-Length is required
+//
 // NB This doesn't allow setting the content type of the attachment
-func MultipartUpload(in io.Reader, params url.Values, contentName, fileName string) (io.ReadCloser, string, error) {
+func MultipartUpload(in io.Reader, params url.Values, contentName, fileName string) (io.ReadCloser, string, int64, error) {
 	bodyReader, bodyWriter := io.Pipe()
 	writer := multipart.NewWriter(bodyWriter)
 	contentType := writer.FormDataContentType()
+
+	// Create a Multipart Writer as base for calculating the Content-Length
+	buf := &bytes.Buffer{}
+	dummyMultipartWriter := multipart.NewWriter(buf)
+	err := dummyMultipartWriter.SetBoundary(writer.Boundary())
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	for key, vals := range params {
+		for _, val := range vals {
+			err := dummyMultipartWriter.WriteField(key, val)
+			if err != nil {
+				return nil, "", 0, err
+			}
+		}
+	}
+	if in != nil {
+		_, err = dummyMultipartWriter.CreateFormFile(contentName, fileName)
+		if err != nil {
+			return nil, "", 0, err
+		}
+	}
+
+	err = dummyMultipartWriter.Close()
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	multipartLength := int64(buf.Len())
 
 	// Pump the data in the background
 	go func() {
@@ -309,16 +358,18 @@ func MultipartUpload(in io.Reader, params url.Values, contentName, fileName stri
 			}
 		}
 
-		part, err := writer.CreateFormFile(contentName, fileName)
-		if err != nil {
-			_ = bodyWriter.CloseWithError(errors.Wrap(err, "failed to create form file"))
-			return
-		}
+		if in != nil {
+			part, err := writer.CreateFormFile(contentName, fileName)
+			if err != nil {
+				_ = bodyWriter.CloseWithError(errors.Wrap(err, "failed to create form file"))
+				return
+			}
 
-		_, err = io.Copy(part, in)
-		if err != nil {
-			_ = bodyWriter.CloseWithError(errors.Wrap(err, "failed to copy data"))
-			return
+			_, err = io.Copy(part, in)
+			if err != nil {
+				_ = bodyWriter.CloseWithError(errors.Wrap(err, "failed to copy data"))
+				return
+			}
 		}
 
 		err = writer.Close()
@@ -330,12 +381,18 @@ func MultipartUpload(in io.Reader, params url.Values, contentName, fileName stri
 		_ = bodyWriter.Close()
 	}()
 
-	return bodyReader, contentType, nil
+	return bodyReader, contentType, multipartLength, nil
 }
 
 // CallJSON runs Call and decodes the body as a JSON object into response (if not nil)
 //
 // If request is not nil then it will be JSON encoded as the body of the request
+//
+// If response is not nil then the response will be JSON decoded into
+// it and resp.Body will be closed.
+//
+// If response is nil then the resp.Body will be closed only if
+// opts.NoResponse is set.
 //
 // If (opts.MultipartParams or opts.MultipartContentName) and
 // opts.Body are set then CallJSON will do a multipart upload with a
@@ -346,25 +403,31 @@ func MultipartUpload(in io.Reader, params url.Values, contentName, fileName stri
 // parameter name MultipartMetadataName.
 //
 // It will return resp if at all possible, even if err is set
-func (api *Client) CallJSON(opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
-	return api.callCodec(opts, request, response, json.Marshal, DecodeJSON, "application/json")
+func (api *Client) CallJSON(ctx context.Context, opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+	return api.callCodec(ctx, opts, request, response, json.Marshal, DecodeJSON, "application/json")
 }
 
 // CallXML runs Call and decodes the body as a XML object into response (if not nil)
 //
 // If request is not nil then it will be XML encoded as the body of the request
 //
+// If response is not nil then the response will be XML decoded into
+// it and resp.Body will be closed.
+//
+// If response is nil then the resp.Body will be closed only if
+// opts.NoResponse is set.
+//
 // See CallJSON for a description of MultipartParams and related opts
 //
 // It will return resp if at all possible, even if err is set
-func (api *Client) CallXML(opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
-	return api.callCodec(opts, request, response, xml.Marshal, DecodeXML, "application/xml")
+func (api *Client) CallXML(ctx context.Context, opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+	return api.callCodec(ctx, opts, request, response, xml.Marshal, DecodeXML, "application/xml")
 }
 
 type marshalFn func(v interface{}) ([]byte, error)
 type decodeFn func(resp *http.Response, result interface{}) (err error)
 
-func (api *Client) callCodec(opts *Opts, request interface{}, response interface{}, marshal marshalFn, decode decodeFn, contentType string) (resp *http.Response, err error) {
+func (api *Client) callCodec(ctx context.Context, opts *Opts, request interface{}, response interface{}, marshal marshalFn, decode decodeFn, contentType string) (resp *http.Response, err error) {
 	var requestBody []byte
 	// Marshal the request if given
 	if request != nil {
@@ -379,8 +442,7 @@ func (api *Client) callCodec(opts *Opts, request interface{}, response interface
 			opts.Body = bytes.NewBuffer(requestBody)
 		}
 	}
-	isMultipart := (opts.MultipartParams != nil || opts.MultipartMetadataName != "") && opts.Body != nil
-	if isMultipart {
+	if opts.MultipartParams != nil || opts.MultipartContentName != "" {
 		params := opts.MultipartParams
 		if params == nil {
 			params = url.Values{}
@@ -389,15 +451,21 @@ func (api *Client) callCodec(opts *Opts, request interface{}, response interface
 			params.Add(opts.MultipartMetadataName, string(requestBody))
 		}
 		opts = opts.Copy()
-		opts.Body, opts.ContentType, err = MultipartUpload(opts.Body, params, opts.MultipartContentName, opts.MultipartFileName)
+
+		var overhead int64
+		opts.Body, opts.ContentType, overhead, err = MultipartUpload(opts.Body, params, opts.MultipartContentName, opts.MultipartFileName)
 		if err != nil {
 			return nil, err
 		}
+		if opts.ContentLength != nil {
+			*opts.ContentLength += overhead
+		}
 	}
-	resp, err = api.Call(opts)
+	resp, err = api.Call(ctx, opts)
 	if err != nil {
 		return resp, err
 	}
+	// if opts.NoResponse is set, resp.Body will have been closed by Call()
 	if response == nil || opts.NoResponse {
 		return resp, nil
 	}

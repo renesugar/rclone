@@ -1,18 +1,19 @@
-// +build linux darwin freebsd
+// +build linux,go1.13 darwin,go1.13 freebsd,go1.13
 
 package mount
 
 import (
+	"context"
 	"os"
 	"time"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
-	"github.com/ncw/rclone/cmd/mountlib"
-	"github.com/ncw/rclone/fs/log"
-	"github.com/ncw/rclone/vfs"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
+	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs"
 )
 
 // Dir represents a directory entry
@@ -20,7 +21,7 @@ type Dir struct {
 	*vfs.Dir
 }
 
-// Check interface satsified
+// Check interface satisfied
 var _ fusefs.Node = (*Dir)(nil)
 
 // Attr updates the attributes of a directory
@@ -96,10 +97,15 @@ func (d *Dir) ReadDirAll(ctx context.Context) (dirents []fuse.Dirent, err error)
 		return nil, translateError(err)
 	}
 	for _, node := range items {
+		name := node.Name()
+		if len(name) >= mountlib.MaxLeafSize {
+			fs.Errorf(d, "Name too long (%d bytes) for FUSE, skipping: %s", len(name), name)
+			continue
+		}
 		var dirent = fuse.Dirent{
 			// Inode FIXME ???
 			Type: fuse.DT_File,
-			Name: node.Name(),
+			Name: name,
 		}
 		if node.IsDir() {
 			dirent.Type = fuse.DT_Dir
@@ -189,7 +195,7 @@ var _ fusefs.NodeLinker = (*Dir)(nil)
 
 // Link creates a new directory entry in the receiver based on an
 // existing Node. Receiver must be a directory.
-func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fusefs.Node) (new fusefs.Node, err error) {
-	defer log.Trace(d, "req=%v, old=%v", req, old)("new=%v, err=%v", &new, &err)
+func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fusefs.Node) (newNode fusefs.Node, err error) {
+	defer log.Trace(d, "req=%v, old=%v", req, old)("new=%v, err=%v", &newNode, &err)
 	return nil, fuse.ENOSYS
 }

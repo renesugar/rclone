@@ -4,6 +4,7 @@ package fs
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -12,6 +13,17 @@ import (
 
 // SizeSuffix is an int64 with a friendly way of printing setting
 type SizeSuffix int64
+
+// Common multipliers for SizeSuffix
+const (
+	Byte SizeSuffix = 1 << (iota * 10)
+	KibiByte
+	MebiByte
+	GibiByte
+	TebiByte
+	PebiByte
+	ExbiByte
+)
 
 // Turn SizeSuffix into a string and a suffix
 func (x SizeSuffix) string() (string, string) {
@@ -108,5 +120,26 @@ func (x *SizeSuffix) Set(s string) error {
 
 // Type of the value
 func (x *SizeSuffix) Type() string {
-	return "int64"
+	return "SizeSuffix"
+}
+
+// Scan implements the fmt.Scanner interface
+func (x *SizeSuffix) Scan(s fmt.ScanState, ch rune) error {
+	token, err := s.Token(true, nil)
+	if err != nil {
+		return err
+	}
+	return x.Set(string(token))
+}
+
+// SizeSuffixList is a slice SizeSuffix values
+type SizeSuffixList []SizeSuffix
+
+func (l SizeSuffixList) Len() int           { return len(l) }
+func (l SizeSuffixList) Swap(i, j int)      { l[i], l[j] = l[j], l[i] }
+func (l SizeSuffixList) Less(i, j int) bool { return l[i] < l[j] }
+
+// Sort sorts the list
+func (l SizeSuffixList) Sort() {
+	sort.Sort(l)
 }

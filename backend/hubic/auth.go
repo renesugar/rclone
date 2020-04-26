@@ -1,9 +1,12 @@
 package hubic
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/ncw/swift"
+	"github.com/rclone/rclone/fs"
 )
 
 // auth is an authenticator for swift
@@ -21,12 +24,17 @@ func newAuth(f *Fs) *auth {
 // Request constructs a http.Request for authentication
 //
 // returns nil for not needed
-func (a *auth) Request(*swift.Connection) (*http.Request, error) {
-	err := a.f.getCredentials()
-	if err != nil {
-		return nil, err
+func (a *auth) Request(*swift.Connection) (r *http.Request, err error) {
+	const retries = 10
+	for try := 1; try <= retries; try++ {
+		err = a.f.getCredentials(context.TODO())
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		fs.Debugf(a.f, "retrying auth request %d/%d: %v", try, retries, err)
 	}
-	return nil, nil
+	return nil, err
 }
 
 // Response parses the result of an http request

@@ -17,7 +17,9 @@ Each path as it passes through rclone is matched against the include
 and exclude rules like `--include`, `--exclude`, `--include-from`,
 `--exclude-from`, `--filter`, or `--filter-from`. The simplest way to
 try them out is using the `ls` command, or `--dry-run` together with
-`-v`.
+`-v`. `--filter-from`, `--exclude-from`, `--include-from`, `--files-from`,
+`--files-from-raw` understand `-` as a file name to mean read from standard
+input.
 
 ## Patterns ##
 
@@ -60,7 +62,7 @@ A `?` matches any character except a slash `/`.
           - matches "lass"
           - doesn't match "floss"
 
-A `[` and `]` together make a a character class, such as `[a-z]` or
+A `[` and `]` together make a character class, such as `[a-z]` or
 `[aeiou]` or `[[:alpha:]]`.  See the [go regexp
 docs](https://golang.org/pkg/regexp/syntax/) for more info on these.
 
@@ -82,6 +84,18 @@ Special characters can be escaped with a `\` before them.
     \*.jpg       - matches "*.jpg"
     \\.jpg       - matches "\.jpg"
     \[one\].jpg  - matches "[one].jpg"
+
+Patterns are case sensitive unless the `--ignore-case` flag is used.
+
+Without `--ignore-case` (default)
+
+    potato - matches "potato"
+           - doesn't match "POTATO"
+
+With `--ignore-case`
+
+    potato - matches "potato"
+           - matches "POTATO"
 
 Note also that rclone filter globs can only be used in one of the
 filter command line flags, not in the specification of the remote, so
@@ -166,6 +180,7 @@ type.
   * `--exclude-from`
   * `--filter`
   * `--filter-from`
+  * `--filter-from-raw`
 
 **Important** You should not use `--include*` together with `--exclude*`. 
 It may produce different results than you expected. In that case try to use: `--filter*`.
@@ -293,12 +308,26 @@ This reads a list of file names from the file passed in and **only**
 these files are transferred.  The **filtering rules are ignored**
 completely if you use this option.
 
+`--files-from` expects a list of files as it's input. Leading / trailing
+whitespace is stripped from the input lines and lines starting with `#`
+and `;` are ignored.
+
+Rclone will traverse the file system if you use `--files-from`,
+effectively using the files in `--files-from` as a set of filters.
+Rclone will not error if any of the files are missing.
+
+If you use `--no-traverse` as well as `--files-from` then rclone will
+not traverse the destination file system, it will find each file
+individually using approximately 1 API call. This can be more
+efficient for small lists of files.
+
 This option can be repeated to read from more than one file.  These
 are read in the order that they are placed on the command line.
 
 Paths within the `--files-from` file will be interpreted as starting
 with the root specified in the command.  Leading `/` characters are
-ignored.
+ignored. See [--files-from-raw](#files-from-raw-read-list-of-source-file-names-without-any-processing)
+if you need the input to be processed in a raw manner.
 
 For example, suppose you had `files-from.txt` with this content:
 
@@ -313,7 +342,7 @@ You could then use it like this:
 This will transfer these files only (if they exist)
 
     /home/me/pics/file1.jpg        → remote:pics/file1.jpg
-    /home/me/pics/subdir/file2.jpg → remote:pics/subdirfile1.jpg
+    /home/me/pics/subdir/file2.jpg → remote:pics/subdir/file2.jpg
 
 To take a more complicated example, let's say you had a few files you
 want to back up regularly with these absolute paths:
@@ -339,7 +368,7 @@ The 3 files will arrive in `remote:backup` with the paths as in the
 
     /home/user1/important → remote:backup/user1/important
     /home/user1/dir/file  → remote:backup/user1/dir/file
-    /home/user2/stuff     → remote:backup/stuff
+    /home/user2/stuff     → remote:backup/user2/stuff
 
 You could of course choose `/` as the root too in which case your
 `files-from.txt` might look like this.
@@ -354,9 +383,16 @@ And you would transfer it like this
 
 In this case there will be an extra `home` directory on the remote:
 
-    /home/user1/important → remote:home/backup/user1/important
-    /home/user1/dir/file  → remote:home/backup/user1/dir/file
-    /home/user2/stuff     → remote:home/backup/stuff
+    /home/user1/important → remote:backup/home/user1/important
+    /home/user1/dir/file  → remote:backup/home/user1/dir/file
+    /home/user2/stuff     → remote:backup/home/user2/stuff
+
+### `--files-from-raw` - Read list of source-file names without any processing ###
+This option is same as `--files-from` with the only difference being that the input
+is read in a raw manner. This means that lines with leading/trailing whitespace and
+lines starting with `;` or `#` are read without any processing. [rclone lsf](/commands/rclone_lsf/)
+has a compatible format that can be used to export file lists from remotes, which
+can then be used as an input to `--files-from-raw`.
 
 ### `--min-size` - Don't transfer any file smaller than this ###
 
@@ -426,6 +462,15 @@ Always test first with `--dry-run` and `-v` before using this flag.
 This dumps the defined filters to the output as regular expressions.
 
 Useful for debugging.
+
+### `--ignore-case` - make searches case insensitive ###
+
+Normally filter patterns are case sensitive.  If this flag is supplied
+then filter patterns become case insensitive.
+
+Normally a `--include "file.txt"` will not match a file called
+`FILE.txt`.  However if you use the `--ignore-case` flag then
+`--include "file.txt"` this will match a file called `FILE.txt`.
 
 ## Quoting shell metacharacters ##
 

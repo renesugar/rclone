@@ -1,17 +1,26 @@
 package copy
 
 import (
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/operations"
-	"github.com/ncw/rclone/fs/sync"
+	"context"
+
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/config/flags"
+	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/sync"
 	"github.com/spf13/cobra"
 )
 
+var (
+	createEmptySrcDirs = false
+)
+
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
+	cmdFlags := commandDefinition.Flags()
+	flags.BoolVarP(cmdFlags, &createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after copy")
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "copy source:path dest:path",
 	Short: `Copy files from source to dest, skipping already copied`,
 	Long: `
@@ -50,15 +59,28 @@ If you are familiar with ` + "`rsync`" + `, rclone always works as if you had
 written a trailing / - meaning "copy the contents of this directory".
 This applies to all commands and whether you are talking about the
 source or destination.
+
+See the [--no-traverse](/docs/#no-traverse) option for controlling
+whether rclone lists the destination directory or not.  Supplying this
+option when copying a small number of files into a large destination
+can speed transfers up greatly.
+
+For example, if you have many files in /path/to/src but only a few of
+them change every day, you can copy all the files which have changed
+recently very efficiently like this:
+
+    rclone copy --max-age 24h --no-traverse /path/to/src remote:
+
+**Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
 			if srcFileName == "" {
-				return sync.CopyDir(fdst, fsrc)
+				return sync.CopyDir(context.Background(), fdst, fsrc, createEmptySrcDirs)
 			}
-			return operations.CopyFile(fdst, fsrc, srcFileName, srcFileName)
+			return operations.CopyFile(context.Background(), fdst, fsrc, srcFileName, srcFileName)
 		})
 	},
 }

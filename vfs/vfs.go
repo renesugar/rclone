@@ -16,39 +16,28 @@
 // error conditions have ocurred.  It may also return general errors
 // it receives.  It tries to use os Error values (eg os.ErrExist)
 // where possible.
+
+//go:generate sh -c "go run make_open_tests.go | gofmt > open_test.go"
+
 package vfs
 
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/log"
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/vfs/vfscache"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
-
-// DefaultOpt is the default values uses for Opt
-var DefaultOpt = Options{
-	NoModTime:         false,
-	NoChecksum:        false,
-	NoSeek:            false,
-	DirCacheTime:      5 * 60 * time.Second,
-	PollInterval:      time.Minute,
-	ReadOnly:          false,
-	Umask:             0,
-	UID:               ^uint32(0), // these values instruct WinFSP-FUSE to use the current user
-	GID:               ^uint32(0), // overriden for non windows in mount_unix.go
-	DirPerms:          os.FileMode(0777) | os.ModeDir,
-	FilePerms:         os.FileMode(0666),
-	CacheMode:         CacheModeOff,
-	CacheMaxAge:       3600 * time.Second,
-	CachePollInterval: 60 * time.Second,
-}
 
 // Node represents either a directory (*Dir) or a file (*File)
 type Node interface {
@@ -168,37 +157,18 @@ var (
 type VFS struct {
 	f         fs.Fs
 	root      *Dir
-	Opt       Options
-	cache     *cache
+	Opt       vfscommon.Options
+	cache     *vfscache.Cache
 	cancel    context.CancelFunc
 	usageMu   sync.Mutex
 	usageTime time.Time
 	usage     *fs.Usage
-}
-
-// Options is options for creating the vfs
-type Options struct {
-	NoSeek            bool          // don't allow seeking if set
-	NoChecksum        bool          // don't check checksums if set
-	ReadOnly          bool          // if set VFS is read only
-	NoModTime         bool          // don't read mod times for files
-	DirCacheTime      time.Duration // how long to consider directory listing cache valid
-	PollInterval      time.Duration
-	Umask             int
-	UID               uint32
-	GID               uint32
-	DirPerms          os.FileMode
-	FilePerms         os.FileMode
-	ChunkSize         fs.SizeSuffix // if > 0 read files in chunks
-	ChunkSizeLimit    fs.SizeSuffix // if > ChunkSize double the chunk size after each chunk until reached
-	CacheMode         CacheMode
-	CacheMaxAge       time.Duration
-	CachePollInterval time.Duration
+	pollChan  chan time.Duration
 }
 
 // New creates a new VFS and root directory.  If opt is nil, then
 // DefaultOpt will be used
-func New(f fs.Fs, opt *Options) *VFS {
+func New(f fs.Fs, opt *vfscommon.Options) *VFS {
 	fsDir := fs.NewDir("", time.Now())
 	vfs := &VFS{
 		f: f,
@@ -208,7 +178,7 @@ func New(f fs.Fs, opt *Options) *VFS {
 	if opt != nil {
 		vfs.Opt = *opt
 	} else {
-		vfs.Opt = DefaultOpt
+		vfs.Opt = vfscommon.DefaultOpt
 	}
 
 	// Mask the permissions with the umask
@@ -221,13 +191,13 @@ func New(f fs.Fs, opt *Options) *VFS {
 	// Create root directory
 	vfs.root = newDir(vfs, f, nil, fsDir)
 
-	// Start polling if required
-	if vfs.Opt.PollInterval > 0 {
-		if do := vfs.f.Features().ChangeNotify; do != nil {
-			do(vfs.notifyFunc, vfs.Opt.PollInterval)
-		} else {
-			fs.Infof(f, "poll-interval is not supported by this remote")
-		}
+	// Start polling function
+	if do := vfs.f.Features().ChangeNotify; do != nil {
+		vfs.pollChan = make(chan time.Duration)
+		do(context.TODO(), vfs.root.changeNotify, vfs.pollChan)
+		vfs.pollChan <- vfs.Opt.PollInterval
+	} else {
+		fs.Infof(f, "poll-interval is not supported by this remote")
 	}
 
 	vfs.SetCacheMode(vfs.Opt.CacheMode)
@@ -237,19 +207,25 @@ func New(f fs.Fs, opt *Options) *VFS {
 	return vfs
 }
 
+// Fs returns the Fs passed into the New call
+func (vfs *VFS) Fs() fs.Fs {
+	return vfs.f
+}
+
 // SetCacheMode change the cache mode
-func (vfs *VFS) SetCacheMode(cacheMode CacheMode) {
+func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 	vfs.Shutdown()
 	vfs.cache = nil
-	if vfs.Opt.CacheMode > CacheModeOff {
+	if cacheMode > vfscommon.CacheModeOff {
 		ctx, cancel := context.WithCancel(context.Background())
-		cache, err := newCache(ctx, vfs.f, &vfs.Opt) // FIXME pass on context or get from Opt?
+		cache, err := vfscache.New(ctx, vfs.f, &vfs.Opt) // FIXME pass on context or get from Opt?
 		if err != nil {
 			fs.Errorf(nil, "Failed to create vfs cache - disabling: %v", err)
-			vfs.Opt.CacheMode = CacheModeOff
+			vfs.Opt.CacheMode = vfscommon.CacheModeOff
 			cancel()
 			return
 		}
+		vfs.Opt.CacheMode = cacheMode
 		vfs.cancel = cancel
 		vfs.cache = cache
 	}
@@ -265,10 +241,10 @@ func (vfs *VFS) Shutdown() {
 
 // CleanUp deletes the contents of the on disk cache
 func (vfs *VFS) CleanUp() error {
-	if vfs.Opt.CacheMode == CacheModeOff {
+	if vfs.Opt.CacheMode == vfscommon.CacheModeOff {
 		return nil
 	}
-	return vfs.cache.cleanUp()
+	return vfs.cache.CleanUp()
 }
 
 // FlushDirCache empties the directory cache
@@ -287,21 +263,7 @@ func (vfs *VFS) WaitForWriters(timeout time.Duration) {
 	defer tick.Stop()
 	tick.Stop()
 	for {
-		writers := 0
-		vfs.root.walk("", func(d *Dir) {
-			fs.Debugf(d.path, "Looking for writers")
-			// NB d.mu is held by walk() here
-			for leaf, item := range d.items {
-				fs.Debugf(leaf, "reading active writers")
-				if file, ok := item.(*File); ok {
-					n := file.activeWriters()
-					if n != 0 {
-						fs.Debugf(file, "active writers %d", n)
-					}
-					writers += n
-				}
-			}
-		})
+		writers := vfs.root.countActiveWriters()
 		if writers == 0 {
 			return
 		}
@@ -441,6 +403,21 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 	return node.Open(flags)
 }
 
+// Open opens the named file for reading. If successful, methods on
+// the returned file can be used for reading; the associated file
+// descriptor has mode O_RDONLY.
+func (vfs *VFS) Open(name string) (Handle, error) {
+	return vfs.OpenFile(name, os.O_RDONLY, 0)
+}
+
+// Create creates the named file with mode 0666 (before umask), truncating
+// it if it already exists. If successful, methods on the returned
+// File can be used for I/O; the associated file descriptor has mode
+// O_RDWR.
+func (vfs *VFS) Create(name string) (Handle, error) {
+	return vfs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+}
+
 // Rename oldName to newName
 func (vfs *VFS) Rename(oldName, newName string) error {
 	// find the parent directories
@@ -459,6 +436,37 @@ func (vfs *VFS) Rename(oldName, newName string) error {
 	return nil
 }
 
+// This works out the missing values from (total, used, free) using
+// unknownFree as the intended free space
+func fillInMissingSizes(total, used, free, unknownFree int64) (newTotal, newUsed, newFree int64) {
+	if total < 0 {
+		if free >= 0 {
+			total = free
+		} else {
+			total = unknownFree
+		}
+		if used >= 0 {
+			total += used
+		}
+	}
+	// total is now defined
+	if used < 0 {
+		if free >= 0 {
+			used = total - free
+		} else {
+			used = 0
+		}
+	}
+	// used is now defined
+	if free < 0 {
+		free = total - used
+	}
+	return total, used, free
+}
+
+// If the total size isn't known then we will aim for this many bytes free (1PB)
+const unknownFreeBytes = 1 << 50
+
 // Statfs returns into about the filing system if known
 //
 // The values will be -1 if they aren't known
@@ -470,12 +478,9 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 	defer vfs.usageMu.Unlock()
 	total, used, free = -1, -1, -1
 	doAbout := vfs.f.Features().About
-	if doAbout == nil {
-		return
-	}
-	if vfs.usageTime.IsZero() || time.Since(vfs.usageTime) >= vfs.Opt.DirCacheTime {
+	if doAbout != nil && (vfs.usageTime.IsZero() || time.Since(vfs.usageTime) >= vfs.Opt.DirCacheTime) {
 		var err error
-		vfs.usage, err = doAbout()
+		vfs.usage, err = doAbout(context.TODO())
 		vfs.usageTime = time.Now()
 		if err != nil {
 			fs.Errorf(vfs.f, "Statfs failed: %v", err)
@@ -493,15 +498,82 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 			used = *u.Used
 		}
 	}
+	total, used, free = fillInMissingSizes(total, used, free, unknownFreeBytes)
 	return
 }
 
-// notifyFunc removes the last path segement for directories and calls ForgetPath with the result.
-//
-// This ensures that new or renamed directories appear in their parent.
-func (vfs *VFS) notifyFunc(relativePath string, entryType fs.EntryType) {
-	if entryType == fs.EntryDirectory {
-		relativePath = path.Dir(relativePath)
+// Remove removes the named file or (empty) directory.
+func (vfs *VFS) Remove(name string) error {
+	node, err := vfs.Stat(name)
+	if err != nil {
+		return err
 	}
-	vfs.root.ForgetPath(relativePath, entryType)
+	err = node.Remove()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Chtimes changes the access and modification times of the named file, similar
+// to the Unix utime() or utimes() functions.
+//
+// The underlying filesystem may truncate or round the values to a less precise
+// time unit.
+func (vfs *VFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	node, err := vfs.Stat(name)
+	if err != nil {
+		return err
+	}
+	err = node.SetModTime(mtime)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Mkdir creates a new directory with the specified name and permission bits
+// (before umask).
+func (vfs *VFS) Mkdir(name string, perm os.FileMode) error {
+	dir, leaf, err := vfs.StatParent(name)
+	if err != nil {
+		return err
+	}
+	_, err = dir.Mkdir(leaf)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadDir reads the directory named by dirname and returns
+// a list of directory entries sorted by filename.
+func (vfs *VFS) ReadDir(dirname string) ([]os.FileInfo, error) {
+	f, err := vfs.Open(dirname)
+	if err != nil {
+		return nil, err
+	}
+	list, err := f.Readdir(-1)
+	closeErr := f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name() < list[j].Name() })
+	return list, nil
+}
+
+// ReadFile reads the file named by filename and returns the contents.
+// A successful call returns err == nil, not err == EOF. Because ReadFile
+// reads the whole file, it does not treat an EOF from Read as an error
+// to be reported.
+func (vfs *VFS) ReadFile(filename string) (b []byte, err error) {
+	f, err := vfs.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.CheckClose(f, &err)
+	return ioutil.ReadAll(f)
 }

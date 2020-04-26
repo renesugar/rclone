@@ -1,22 +1,23 @@
 package deletefile
 
 import (
-	"github.com/ncw/rclone/cmd"
-	"github.com/ncw/rclone/fs/operations"
+	"context"
 
 	"github.com/pkg/errors"
+	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	cmd.Root.AddCommand(commandDefintion)
+	cmd.Root.AddCommand(commandDefinition)
 }
 
-var commandDefintion = &cobra.Command{
+var commandDefinition = &cobra.Command{
 	Use:   "deletefile remote:path",
-	Short: `Remove a single file path from remote.`,
+	Short: `Remove a single file from remote.`,
 	Long: `
-Remove a single file path from remote.  Unlike ` + "`" + `delete` + "`" + ` it cannot be used to
+Remove a single file from remote.  Unlike ` + "`" + `delete` + "`" + ` it cannot be used to
 remove a directory and it doesn't obey include/exclude filters - if the specified file exists,
 it will always be removed.
 `,
@@ -27,11 +28,11 @@ it will always be removed.
 			if fileName == "" {
 				return errors.Errorf("%s is a directory or doesn't exist", args[0])
 			}
-			fileObj, err := fs.NewObject(fileName)
+			fileObj, err := fs.NewObject(context.Background(), fileName)
 			if err != nil {
 				return err
 			}
-			return operations.DeleteFile(fileObj)
+			return operations.DeleteFile(context.Background(), fileObj)
 		})
 	},
 }
